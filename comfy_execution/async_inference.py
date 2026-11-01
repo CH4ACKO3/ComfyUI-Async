@@ -70,6 +70,7 @@ class NodeAdmission:
         sampler_memory = None if serial or self.limit == 1 else self.sampler_memory(class_def, func, inputs)
         safe_parallel = not serial and self.limit != 1 and (
             class_def in (nodes.EmptyImage, nodes.EmptyLatentImage, nodes.ImageScale, nodes.ImageScaleBy, nodes.ImageInvert)
+            or getattr(class_def, 'RELATIVE_PYTHON_MODULE', None) == 'comfy_extras.nodes_primitive'
             or getattr(class_def, 'ASYNC_CONCURRENT_SAFE', False))
         device = mm.get_torch_device()
         resident = None

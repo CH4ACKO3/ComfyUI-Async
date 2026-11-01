@@ -438,7 +438,7 @@ class PromptServer():
         @routes.get("/async/devices")
         async def get_async_devices(request):
             devices = comfy.model_management.get_all_torch_devices()
-            return web.json_response({"enabled": args.async_workers > 0, "devices": [
+            return web.json_response({"enabled": not args.disable_async_execution, "devices": [
                 {"id": str(device), "name": comfy.model_management.torch.cuda.get_device_name(device)}
                 for device in devices if device.type == "cuda"
             ]})
@@ -449,7 +449,7 @@ class PromptServer():
 
         @routes.get("/async/status")
         async def get_async_status(request):
-            return web.json_response(self.async_executor.scheduler.snapshot() if args.async_workers else {})
+            return web.json_response(self.async_executor.scheduler.snapshot() if not args.disable_async_execution else {})
 
         def get_dir_by_type(dir_type):
             if dir_type is None:
@@ -1182,6 +1182,14 @@ class PromptServer():
         async def post_prompt(request):
             logging.info("got prompt")
             json_data =  await request.json()
+            refresh_base = None
+            if "refresh" in json_data:
+                if args.disable_async_execution or "prompt" in json_data:
+                    return web.json_response({"error": "Node refresh requires the resident graph scheduler and no prompt field"}, status=400)
+                try:
+                    json_data["prompt"], refresh_base = self.async_executor.expand_refresh(json_data)
+                except (ValueError, TypeError) as exc:
+                    return web.json_response({"error": str(exc)}, status=400)
             json_data = self.trigger_on_prompt(json_data)
 
             if "number" in json_data:
@@ -1218,7 +1226,7 @@ class PromptServer():
 
                 self.node_replace_manager.apply_replacements(prompt)
 
-                if args.async_workers:
+                if not args.disable_async_execution:
                     available_devices = {str(device) for device in comfy.model_management.get_all_torch_devices() if device.type == "cuda"}
                     for node_id, node in prompt.items():
                         devices = node.get("_meta", {}).get("gpu_devices", [])
@@ -1252,9 +1260,9 @@ class PromptServer():
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
                     extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
                     item = (number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive)
-                    if args.async_workers:
+                    if not args.disable_async_execution:
                         try:
-                            self.async_executor.enqueue(item)
+                            self.async_executor.enqueue(item, base_revision=refresh_base)
                         except (ValueError, OverflowError) as exc:
                             return web.json_response({"error": {"type": "invalid_execution_session", "message": str(exc), "details": "", "extra_info": {}}, "node_errors": {}}, status=429 if isinstance(exc, OverflowError) else 400)
                     else:

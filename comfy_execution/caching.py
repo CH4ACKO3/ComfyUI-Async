@@ -115,6 +115,8 @@ class CacheKeySetInputSignature(CacheKeySet):
         class_type = node["class_type"]
         class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
         signature = [class_type, await self.is_changed_cache.get(node_id)]
+        if "input_revision" in node.get("_meta", {}):
+            signature.append(("input_revision", node["_meta"]["input_revision"]))
         placement = dynprompt.get_node(dynprompt.get_real_node_id(node_id)).get("_meta", {}).get("gpu_devices")
         if placement is not None:
             signature.append(("gpu_devices", placement))

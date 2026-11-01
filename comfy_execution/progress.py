@@ -326,6 +326,10 @@ scoped_progress_registry = ContextVar("scoped_progress_registry", default=None)
 def reset_progress_state(prompt_id: str, dynprompt: "DynamicPrompt") -> None:
     global global_progress_registry
 
+    if scoped_progress_registry.get() is not None:
+        scoped_progress_registry.set(ProgressRegistry(prompt_id, dynprompt))
+        return
+
     # Reset existing handlers if registry exists
     if global_progress_registry is not None:
         global_progress_registry.reset_handlers()

@@ -3,11 +3,13 @@
 import asyncio
 import atexit
 import concurrent.futures
+import copy
 import contextvars
 import heapq
 import json
 import logging
 import os
+import queue
 import secrets
 import subprocess
 import sys
@@ -113,18 +115,7 @@ class Worker:
                 return payload
 
     def request(self, command, payload=None):
-        if self.config["role"] == "node":
-            return self.submit(command, payload).result()
-        with self.mutex:
-            if self.closed:
-                raise WorkerError("Execution interrupted")
-            if self.process is None:
-                self.start()
-            try:
-                self.connection.send((command, payload))
-            except (BrokenPipeError, OSError) as exc:
-                raise WorkerError("Execution worker stopped") from exc
-            return self.receive()
+        return self.submit(command, payload).result()
 
     def submit(self, command, payload):
         with self.mutex:
@@ -161,6 +152,7 @@ class Worker:
                 else:
                     future.set_result(response)
         except (EOFError, OSError):
+            self.closed = True
             with self.pending_mutex:
                 pending, self.pending = self.pending, {}
             for future in pending.values():
@@ -191,8 +183,61 @@ class Worker:
             self.connection.close()
 
 
+class BrokerChannel:
+    def __init__(self, config):
+        self.connection = Client(tuple(config["broker_address"]), authkey=bytes.fromhex(config["broker_authkey"]))
+        self.outgoing = queue.Queue()
+        self.pending = {}
+        self.mutex = threading.Lock()
+        self.index = 0
+        self.closed = False
+        threading.Thread(target=self.write, daemon=True).start()
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def submit(self, command, payload):
+        with self.mutex:
+            if self.closed:
+                raise WorkerError("Graph scheduler connection closed")
+            self.index += 1
+            future = concurrent.futures.Future()
+            self.pending[self.index] = future
+            self.outgoing.put((self.index, command, payload))
+        return future
+
+    def fail(self):
+        with self.mutex:
+            self.closed = True
+            pending, self.pending = self.pending, {}
+        for future in pending.values():
+            if future.set_running_or_notify_cancel():
+                future.set_exception(WorkerError("Graph scheduler connection closed"))
+        self.outgoing.put(None)
+
+    def write(self):
+        try:
+            while (message := self.outgoing.get()) is not None:
+                self.connection.send(message)
+        except (EOFError, OSError):
+            self.fail()
+
+    def read(self):
+        try:
+            while True:
+                request_id, kind, value = self.connection.recv()
+                with self.mutex:
+                    future = self.pending.pop(request_id, None)
+                if future is not None and future.set_running_or_notify_cancel():
+                    if kind == "error":
+                        future.set_exception(WorkerError(value))
+                    else:
+                        future.set_result(value)
+        except (EOFError, OSError):
+            self.fail()
+
+
 class Runtime:
-    def __init__(self, config, server):
+    def __init__(self, config, server, channel):
+        self.channel = channel
         self.config = config
         self.server = server
         self.owner = config["owner"]
@@ -200,23 +245,12 @@ class Runtime:
         self.dynprompt = None
         self.prompt_id = None
         self.extra_data = {}
+        self.tasks = set()
 
     def intern(self, value):
         if isinstance(value, ObjectRef):
             value = self.refs.setdefault((value.worker, value.generation, value.key), value)
         return value
-
-    def request(self, command, payload):
-        with Client(tuple(self.config["broker_address"]), authkey=bytes.fromhex(self.config["broker_authkey"])) as connection:
-            connection.send((command, payload))
-            kind, result = connection.recv()
-        if kind == "error":
-            if command == "call" and self.prompt_id and os.path.exists(os.path.join(self.config["lock_directory"], self.prompt_id + ".cancel")):
-                # Imported here because model_management imports execution helpers during startup.
-                from comfy.model_management import InterruptProcessingException
-                raise InterruptProcessingException()
-            raise WorkerError(result)
-        return result
 
     async def call(self, node_id, index, func, inputs, v3_data):
         root_id = self.dynprompt.get_real_node_id(node_id)
@@ -235,31 +269,33 @@ class Runtime:
             "extra_data": self.extra_data,
             "sockets_metadata": self.server.sockets_metadata,
         }
-        result = await asyncio.to_thread(self.request, "call", payload)
-        return map_values(result, self.intern)
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        try:
+            try:
+                result = await asyncio.wrap_future(self.channel.submit("call", payload))
+            except WorkerError:
+                if self.prompt_id and os.path.exists(os.path.join(self.config["lock_directory"], self.prompt_id + ".cancel")):
+                    from comfy.model_management import InterruptProcessingException
+                    raise InterruptProcessingException()
+                raise
+            return map_values(result, self.intern)
+        finally:
+            self.tasks.discard(task)
 
-    def trim(self):
-        nodes = [(node_id, self.dynprompt.get_node(node_id)["class_type"]) for node_id in self.dynprompt.all_node_ids()]
-        self.request("trim", {"owner": self.owner, "objects": list(self.refs.values()), "nodes": nodes,
-                              "session_id": session_key(self.extra_data)})
 
-    def close(self):
-        self.request("release", {"owner": self.owner})
-
-
-class AsyncExecutorPool:
-    def __init__(self, server, queue, asset_manager, slots, default_device):
+class ResidentGraphExecutor:
+    def __init__(self, server, queue, asset_manager, default_device):
         self.server = server
         self.queue = queue
         self.asset_manager = asset_manager
-        self.slots = slots
         self.directory = tempfile.TemporaryDirectory(prefix="comfy-gpu-")
         self.running = {}
-        self.idle = set()
+        self.worker = None
         self.cancelled = set()
         self.clear_requested = False
         self.revisions = OrderedDict()
-        self.session_slots = {}
+        self.frames = {}
         from comfy_execution.async_scheduler import DeviceScheduler
         self.scheduler = DeviceScheduler(self.directory.name, default_device, server.send_sync)
         self.stopping = threading.Event()
@@ -280,25 +316,22 @@ class AsyncExecutorPool:
                 self.clear_requested = True
                 return
             self.clear_requested = False
-            for worker in self.idle:
-                worker.close()
-            self.idle.clear()
+            if self.worker is not None:
+                self.worker.close()
+                self.worker = None
             self.scheduler.clear()
 
     def shutdown(self):
         self.stopping.set()
         self.interrupt()
-        with self.mutex:
-            workers = list(self.running.values()) + list(self.idle)
-        for worker in workers:
-            worker.close()
+        if self.worker is not None:
+            self.worker.close()
         self.scheduler.close()
 
     def start(self):
-        for index in range(self.slots):
-            threading.Thread(target=self.run_slot, args=(index,), name=f"prompt-{index}", daemon=True).start()
+        threading.Thread(target=self.dispatch, name="graph-inputs", daemon=True).start()
 
-    def enqueue(self, item):
+    def enqueue(self, item, base_revision=None):
         # Queue ownership makes revision checks and replacement atomic with dequeue.
         import execution
 
@@ -313,6 +346,8 @@ class AsyncExecutorPool:
         session = item[3]["execution_session"] = {"id": session["id"], "revision": session["revision"], "policy": session.get("policy", "latest")}
         key = session_key(item[3])
         with self.queue.mutex:
+            if base_revision is not None and base_revision != self.revisions.get(key):
+                raise ValueError("Graph changed while validating this refresh; resubmit it")
             if session["revision"] <= self.revisions.get(key, -1):
                 raise ValueError("execution_session revision must increase")
             pending = [queued for queued in self.queue.queue if session_key(queued[3]) == key]
@@ -324,10 +359,8 @@ class AsyncExecutorPool:
                 if oldest is None:
                     raise OverflowError("Too many active execution sessions")
                 del self.revisions[oldest]
-                del self.session_slots[oldest]
-            if key not in self.session_slots:
-                assigned = [self.session_slots.get(session_key(queued[3])) for queued in self.queue.queue + list(self.queue.currently_running.values())]
-                self.session_slots[key] = min(range(self.slots), key=lambda slot: (assigned.count(slot), list(self.session_slots.values()).count(slot)))
+                del self.frames[oldest]
+            self.frames[key] = copy.deepcopy(item[2])
             self.revisions[key] = session["revision"]
             self.revisions.move_to_end(key)
             if session["policy"] == "latest":
@@ -344,78 +377,93 @@ class AsyncExecutorPool:
                     self.queue.task_done(item_id, {}, execution.PromptQueue.ExecutionStatus("error", False, [("execution_superseded", details)]), process_item=lambda prompt: prompt[:5])
                     self.server.send_sync("execution_superseded", details, item[3].get("client_id"))
 
-    def accepts(self, item, slot):
-        key = session_key(item[3])
-        if key is None:
-            return True
-        if item[3]["execution_session"]["policy"] == "fifo":
-            return True
-        return self.session_slots[key] == slot
+    def expand_refresh(self, data):
+        extra_data = dict(data.get("extra_data", {}), client_id=data.get("client_id", ""))
+        session = extra_data.get("execution_session")
+        if not isinstance(session, dict) or not isinstance(session.get("id"), str) or type(session.get("revision")) is not int:
+            raise ValueError("A refresh requires execution_session id and integer revision")
+        changes = data["refresh"]
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("refresh must map node IDs to updated inputs")
+        key = session_key(extra_data)
+        with self.queue.mutex:
+            if key not in self.frames:
+                raise ValueError("Submit the full graph with this execution_session before refreshing nodes")
+            prompt = copy.deepcopy(self.frames[key])
+            base_revision = self.revisions[key]
+        for node_id, inputs in changes.items():
+            if node_id not in prompt or not isinstance(inputs, dict):
+                raise ValueError("Each refresh entry must identify an existing node and an input mapping")
+            prompt[node_id]["inputs"].update(inputs)
+            prompt[node_id].setdefault("_meta", {})["input_revision"] = session["revision"]
+        return prompt, base_revision
 
-    def run_slot(self, slot):
-        # Import here to avoid the execution -> async_execution -> execution cycle.
-        import execution
+    def forward(self, item, event, data, sid=None):
         from comfy_execution.asset_enrichment import register_executed_outputs
         from protocol import BinaryEventTypes
 
-        worker = None
+        metadata = item[3].get("workflow_metadata", {})
+        if "execution_session" in item[3]:
+            metadata = {**metadata, "execution_session": item[3]["execution_session"]}
+        if isinstance(data, dict) and "prompt_id" in data:
+            data = {**metadata, **data}
+            if event == "executed":
+                data["output"] = register_executed_outputs(data["output"], item[1], self.asset_manager)
+        elif event == BinaryEventTypes.PREVIEW_IMAGE_WITH_METADATA and isinstance(data, tuple):
+            data = (data[0], {**metadata, **data[1]})
+        self.server.send_sync(event, data, sid)
+
+    def dispatch(self):
         while not self.stopping.is_set():
             flags = self.queue.get_flags()
             if flags.get("free_memory") or flags.get("unload_models"):
                 self.clear()
-            queued = self.queue.get(timeout=0.5, predicate=lambda item: self.accepts(item, slot))
+            queued = self.queue.get(timeout=0.5)
             if queued is None:
                 continue
             item, item_id = queued
-            prompt_id = item[1]
-            client_id = item[3].get("client_id")
-
-            def forward(event, data, sid=None):
-                metadata = item[3].get("workflow_metadata", {})
-                if "execution_session" in item[3]:
-                    metadata = {**metadata, "execution_session": item[3]["execution_session"]}
-                if isinstance(data, dict) and "prompt_id" in data:
-                    data = {**metadata, **data}
-                    if event == "executed":
-                        data["output"] = register_executed_outputs(data["output"], prompt_id, self.asset_manager)
-                elif event == BinaryEventTypes.PREVIEW_IMAGE_WITH_METADATA and isinstance(data, tuple):
-                    data = (data[0], {**metadata, **data[1]})
-                self.server.send_sync(event, data, sid)
-
             with self.mutex:
                 if self.stopping.is_set():
                     return
-                self.idle.discard(worker)
-                if worker is None or worker.closed:
-                    worker = Worker({"role": "prompt", "owner": secrets.token_hex(16), "lock_directory": self.directory.name, **self.scheduler.config}, forward)
-                worker.send_event = forward
-                self.running[prompt_id] = worker
-                self.scheduler.routes[prompt_id] = forward
+                if self.worker is None or self.worker.closed:
+                    if self.worker is not None:
+                        self.worker.close()
+                        self.scheduler.clear()
+                    self.worker = Worker({"role": "prompt", "lock_directory": self.directory.name, **self.scheduler.config}, self.scheduler.forward)
+                worker = self.worker
+                self.running[item[1]] = worker
+                self.scheduler.routes[item[1]] = lambda event, data, sid=None, item=item: self.forward(item, event, data, sid)
             self.asset_manager.pause_background_scan()
             try:
-                result = worker.request("prompt", {"item": item, "sockets_metadata": self.server.sockets_metadata})
-                history, success, messages = result
-                history["outputs"] = {node_id: register_executed_outputs(output, prompt_id, self.asset_manager) for node_id, output in history["outputs"].items()}
+                future = worker.submit("prompt", {"item": item, "sockets_metadata": self.server.sockets_metadata})
             except Exception as exc:
-                logging.exception("Async prompt %s failed", prompt_id)
-                event = "execution_interrupted" if prompt_id in self.cancelled else "execution_error"
-                details = {"prompt_id": prompt_id, "node_id": None, "node_type": "", "executed": [], "exception_message": str(exc), "exception_type": type(exc).__name__, "traceback": [], "timestamp": int(time.time() * 1000)}
-                forward(event, details, client_id)
-                history, success, messages = {}, False, [(event, details)]
-                self.scheduler.request("cancel", {"prompt_id": prompt_id})
-                worker.close()
-                self.scheduler.request("release", {"owner": worker.config["owner"]})
-            finally:
-                with self.mutex:
-                    self.running.pop(prompt_id, None)
-                    self.idle.add(worker)
-                    self.scheduler.routes.pop(prompt_id, None)
-                    if self.clear_requested:
-                        self.clear()
-            self.queue.task_done(item_id, history, status=execution.PromptQueue.ExecutionStatus(status_str="success" if success else "error", completed=success, messages=messages), process_item=lambda prompt: prompt[:5] + prompt[6:])
-            with self.mutex:
-                self.cancelled.discard(prompt_id)
-            forward("executing", {"node": None, "prompt_id": prompt_id}, client_id)
-            self.asset_manager.queue_output_scan()
-            if self.queue.get_tasks_remaining() == 0:
-                self.asset_manager.resume_background_scan()
+                future = concurrent.futures.Future()
+                future.set_exception(exc)
+            future.add_done_callback(lambda response, item=item, item_id=item_id: self.complete(response, item, item_id))
+
+    def complete(self, response, item, item_id):
+        import execution
+        from comfy_execution.asset_enrichment import register_executed_outputs
+
+        prompt_id, client_id = item[1], item[3].get("client_id")
+        try:
+            history, success, messages = response.result()
+            history["outputs"] = {node_id: register_executed_outputs(output, prompt_id, self.asset_manager) for node_id, output in history["outputs"].items()}
+        except Exception as exc:
+            logging.exception("Graph input %s failed", prompt_id)
+            event = "execution_interrupted" if prompt_id in self.cancelled else "execution_error"
+            details = {"prompt_id": prompt_id, "node_id": None, "node_type": "", "executed": [], "exception_message": str(exc), "exception_type": type(exc).__name__, "traceback": [], "timestamp": int(time.time() * 1000)}
+            self.forward(item, event, details, client_id)
+            history, success, messages = {}, False, [(event, details)]
+            self.scheduler.request("cancel", {"prompt_id": prompt_id})
+        self.queue.task_done(item_id, history, status=execution.PromptQueue.ExecutionStatus(status_str="success" if success else "error", completed=success, messages=messages), process_item=lambda prompt: prompt[:5] + prompt[6:])
+        with self.mutex:
+            self.running.pop(prompt_id, None)
+            self.scheduler.routes.pop(prompt_id, None)
+            self.cancelled.discard(prompt_id)
+            if self.clear_requested:
+                self.clear()
+        self.forward(item, "executing", {"node": None, "prompt_id": prompt_id}, client_id)
+        self.asset_manager.queue_output_scan()
+        if self.queue.get_tasks_remaining() == 0:
+            self.asset_manager.resume_background_scan()

@@ -9,6 +9,7 @@ import traceback
 from enum import Enum
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import asyncio
+from contextlib import nullcontext
 
 import torch
 
@@ -762,7 +763,7 @@ class PromptExecutor:
         comfy.memory_management.set_ram_cache_release_state(ram_release_callback, ram_headroom)
 
         try:
-            with torch.inference_mode():
+            with torch.inference_mode() if active_runtime.get() is None else nullcontext():
                 dynamic_prompt = DynamicPrompt(prompt)
                 runtime = active_runtime.get()
                 if runtime is not None:

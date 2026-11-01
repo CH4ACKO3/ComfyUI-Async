@@ -1,3 +1,4 @@
+from contextvars import ContextVar
 import torch
 from PIL import Image
 from comfy.cli_args import args, LatentPreviewMethod
@@ -10,6 +11,7 @@ import comfy.utils
 import logging
 
 default_preview_method = args.preview_method
+preview_method = ContextVar("preview_method", default=default_preview_method)
 
 MAX_PREVIEW_RESOLUTION = args.preview_size
 VIDEO_TAES = ["taehv", "lighttaew2_2", "lighttaew2_1", "lighttaehy1_5", "taeltx_2", "taeh3"]
@@ -87,7 +89,7 @@ class Latent2RGBPreviewer(LatentPreviewer):
 
 def get_previewer(device, latent_format):
     previewer = None
-    method = args.preview_method
+    method = preview_method.get()
     if method != LatentPreviewMethod.NoPreviews:
         # TODO previewer methods
         taesd_decoder_path = None
@@ -143,6 +145,6 @@ def set_preview_method(override: str = None):
     if override and override != "default":
         method = LatentPreviewMethod.from_string(override)
         if method is not None:
-            args.preview_method = method
+            preview_method.set(method)
             return
-    args.preview_method = default_preview_method
+    preview_method.set(default_preview_method)

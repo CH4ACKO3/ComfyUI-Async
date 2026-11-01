@@ -74,7 +74,7 @@ class DeviceQueue:
                 raise WorkerError("Execution interrupted")
             future.set_result(result["value"])
         except Exception as exc:
-            if not self.closed and self.worker.process is not None and (self.worker.connection is None or self.worker.process.poll() is not None):
+            if not self.closed and self.worker.process is not None and (self.worker.closed or self.worker.connection is None or self.worker.process.poll() is not None):
                 self.close()
             future.set_exception(exc)
         finally:
@@ -129,16 +129,26 @@ class DeviceScheduler:
             threading.Thread(target=self.serve, args=(connection,), daemon=True).start()
 
     def serve(self, connection):
+        send_lock = threading.Lock()
+
+        def respond(request_id, command, payload):
+            try:
+                result = (request_id, "result", self.request(command, payload))
+            except Exception as exc:
+                result = (request_id, "error", str(exc))
+            try:
+                with send_lock:
+                    connection.send(result)
+            except (OSError, EOFError):
+                pass
+
         with connection:
             try:
-                command, payload = connection.recv()
-                result = self.request(command, payload)
-                connection.send(("result", result))
-            except Exception as exc:
-                try:
-                    connection.send(("error", str(exc)))
-                except (OSError, EOFError):
-                    pass
+                while True:
+                    request_id, command, payload = connection.recv()
+                    threading.Thread(target=respond, args=(request_id, command, payload), daemon=True).start()
+            except (OSError, EOFError):
+                pass
 
     def device(self, name):
         worker = self.workers.get(name)

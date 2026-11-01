@@ -266,7 +266,7 @@ if 'torch' in sys.modules:
 import comfy.utils
 
 import execution
-from comfy_execution.async_execution import AsyncExecutorPool
+from comfy_execution.async_execution import ResidentGraphExecutor
 import server
 from app.assets.manager import AssetManager, default_asset_manager  # imports torch, so not before the check above
 from protocol import BinaryEventTypes
@@ -628,8 +628,8 @@ def start_comfyui(asyncio_loop=None):
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    if args.async_workers:
-        prompt_server.async_executor = AsyncExecutorPool(prompt_server, prompt_server.prompt_queue, asset_manager, args.async_workers, str(comfy.model_management.get_torch_device()))
+    if not args.disable_async_execution:
+        prompt_server.async_executor = ResidentGraphExecutor(prompt_server, prompt_server.prompt_queue, asset_manager, str(comfy.model_management.get_torch_device()))
         prompt_server.async_executor.start()
     else:
         threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server, asset_manager)).start()

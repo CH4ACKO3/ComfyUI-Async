@@ -17,7 +17,7 @@ from multiprocessing.connection import Client
 import psutil
 from filelock import FileLock
 
-from comfy_execution.async_execution import ObjectData, ObjectRef, Runtime, active_runtime, map_values, session_key
+from comfy_execution.async_execution import BrokerChannel, ObjectData, ObjectRef, Runtime, active_runtime, map_values, session_key
 
 
 call_payload = contextvars.ContextVar("worker_call_payload", default=None)
@@ -29,7 +29,7 @@ class CallServer:
 
     def send_sync(self, event, data, sid=None):
         payload = call_payload.get()
-        if payload is not None:
+        if payload is not None and "call_id" in payload:
             metadata = {"call_id": payload["call_id"], "list_index": payload["index"]}
             if isinstance(data, dict):
                 data = {**data, **metadata}
@@ -51,6 +51,18 @@ class CallServer:
             if name in fields:
                 return fields[name]
         return getattr(self.server, name)
+
+    def __setattr__(self, name, value):
+        payload = call_payload.get()
+        if payload is not None:
+            fields = {"last_prompt_id": "prompt_id", "last_node_id": "node_id", "sockets_metadata": "sockets_metadata"}
+            if name in fields:
+                payload[fields[name]] = value
+                return
+            if name in ("client_id", "workflow_metadata"):
+                payload["extra_data"][name] = value
+                return
+        object.__setattr__(self, name, value)
 
 
 def run():
@@ -102,6 +114,7 @@ def run():
     from comfy_execution.progress import ProgressRegistry, scoped_progress_registry, add_progress_handler, WebUIProgressHandler
     from comfy_execution.utils import CurrentNodeContext
     from app.assets.manager import NoAssets
+    from latent_preview import set_preview_method
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -111,14 +124,12 @@ def run():
         init_custom_nodes=not args.disable_all_custom_nodes or bool(args.whitelist_custom_nodes),
         init_api_nodes=not args.disable_partner_nodes,
     ))
-    if config["role"] == "node":
-        worker_server = CallServer(worker_server)
-        server.PromptServer.instance = worker_server
-        if args.async_node_concurrency != 1:
-            args.disable_comfy_compiler = True
+    worker_server = CallServer(worker_server)
+    server.PromptServer.instance = worker_server
+    if config["role"] == "node" and args.async_node_concurrency != 1:
+        args.disable_comfy_compiler = True
     main.hijack_progress(worker_server)
     comfy.model_management.set_cudnn_benchmark()
-    active_prompt = None
     interrupt_lock = threading.Lock()
     active_calls = {}
 
@@ -128,8 +139,6 @@ def run():
     def watch_interrupt():
         while True:
             with interrupt_lock:
-                if active_prompt is not None and is_cancelled(active_prompt):
-                    nodes.interrupt_processing(True)
                 for prompt_id, event in active_calls.values():
                     if is_cancelled(prompt_id):
                         event.set()
@@ -139,52 +148,85 @@ def run():
     send(("ready", None))
 
     if config["role"] == "prompt":
-        runtime = Runtime(config, worker_server)
-        # Remote objects own their storage; the coordinator cannot measure their RAM.
-        cache_type = execution.CacheType.NONE if args.cache_none else execution.CacheType.LRU
-        executor = execution.PromptExecutor(worker_server, cache_type=cache_type, cache_args={"lru": args.cache_lru or 128, "ram": 0, "ram_inactive": 0}, asset_manager=NoAssets(args))
-        previous_session = None
-        try:
-            while True:
-                command, payload = connection.recv()
-                item = payload["item"]
-                extra_data = dict(item[3], **item[5])
-                current_session = session_key(extra_data)
-                if current_session != previous_session:
-                    executor.reset()
-                    runtime.close()
-                    runtime = Runtime(config, worker_server)
-                previous_session = current_session
-                runtime.prompt_id = item[1]
-                runtime.extra_data = extra_data
-                worker_server.last_prompt_id = item[1]
-                worker_server.workflow_metadata = extra_data.get("workflow_metadata", {})
-                worker_server.sockets_metadata = payload["sockets_metadata"]
-                with interrupt_lock:
-                    active_prompt = item[1]
-                token = active_runtime.set(runtime)
+        from comfy_execution.resident_graph import ResidentGraph, RevisionCache
+
+        graphs = OrderedDict()
+        tasks = set()
+        channel = BrokerChannel(config)
+
+        async def revise(request_id, payload, graph):
+            item = payload["item"]
+            extra_data = dict(item[3], **item[5])
+            token = call_payload.set({"prompt_id": item[1], "node_id": None, "extra_data": extra_data, "sockets_metadata": payload["sockets_metadata"]})
+            interrupted = threading.Event()
+            interrupt_token = comfy.model_management.processing_interrupt_event.set(interrupted)
+            with interrupt_lock:
+                active_calls[request_id] = (item[1], interrupted)
+            runtime = Runtime(dict(config, owner=graph.owner), worker_server, channel)
+            runtime.prompt_id, runtime.extra_data = item[1], extra_data
+            runtime_token = active_runtime.set(runtime)
+            scoped_progress_registry.set(ProgressRegistry(item[1], DynamicPrompt(item[2])))
+            executor = execution.PromptExecutor(worker_server, cache_type=execution.CacheType.NONE if args.cache_none else execution.CacheType.LRU,
+                                                cache_args={"lru": graph.cache_size, "ram": 0, "ram_inactive": 0}, asset_manager=NoAssets(args))
+            if not args.cache_none:
+                executor.caches.outputs = RevisionCache(graph)
+                executor.caches.all = [executor.caches.outputs, executor.caches.objects]
+            try:
+                await executor.execute_async(item[2], item[1], extra_data, item[4])
+                if not executor.success:
+                    cancelled = is_cancelled(item[1])
+                    await asyncio.wrap_future(channel.submit("cancel", {"prompt_id": item[1]}))
+                    for task in runtime.tasks:
+                        task.cancel()
+                    await asyncio.gather(*runtime.tasks, return_exceptions=True)
+                    if not cancelled:
+                        graph.outputs.clear()
+                result = (executor.history_result, executor.success, executor.status_messages)
+                response = ("result", (request_id, result))
+            except (Exception, comfy.model_management.InterruptProcessingException):
+                graph.outputs.clear()
+                response = ("error", (request_id, traceback.format_exc()))
+            finally:
                 try:
-                    loop.run_until_complete(executor.execute_async(item[2], item[1], extra_data, item[4]))
-                    result = (executor.history_result, executor.success, executor.status_messages)
-                    if not executor.success:
-                        # Stop sibling nodes before reporting a failed workflow.
-                        runtime.request("cancel", {"prompt_id": item[1]})
-                        pending = asyncio.all_tasks(loop)
-                        for task in pending:
-                            task.cancel()
-                        runtime.close()
-                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                        executor.reset()
-                        runtime = Runtime(config, worker_server)
-                    else:
-                        runtime.trim()
-                    send(("result", result))
-                finally:
-                    active_runtime.reset(token)
-                    with interrupt_lock:
-                        active_prompt = None
-        finally:
-            runtime.close()
+                    async with graph.gate:
+                        graph.active -= 1
+                        if not graph.active:
+                            await asyncio.wrap_future(channel.submit("trim", {
+                                "owner": graph.owner, "objects": graph.references(), "session_id": session_key(extra_data),
+                                "nodes": [(node_id, node["class_type"]) for node_id, node in graph.prompt.items()],
+                            }))
+                except Exception:
+                    response = ("error", (request_id, traceback.format_exc()))
+                send(response)
+                with interrupt_lock:
+                    active_calls.pop(request_id, None)
+                active_runtime.reset(runtime_token)
+                comfy.model_management.processing_interrupt_event.reset(interrupt_token)
+                call_payload.reset(token)
+
+        async def receive_inputs():
+            while True:
+                request_id, command, payload = await asyncio.to_thread(connection.recv)
+                item = payload["item"]
+                key = session_key(item[3]) or (item[3].get("client_id", ""), None)
+                if key not in graphs:
+                    graphs[key] = ResidentGraph(args.cache_lru or 128)
+                graph = graphs[key]
+                graphs.move_to_end(key)
+                async with graph.gate:
+                    graph.prompt = item[2]
+                    graph.active += 1
+                task = asyncio.create_task(revise(request_id, payload, graph))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+                while len(graphs) > 256:
+                    oldest = next((key for key, value in graphs.items() if not value.active), None)
+                    if oldest is None:
+                        break
+                    evicted = graphs.pop(oldest)
+                    await asyncio.wrap_future(channel.submit("release", {"owner": evicted.owner}))
+
+        loop.run_until_complete(receive_inputs())
         return
 
     objects = {}
@@ -269,6 +311,7 @@ def run():
         else:
             f = getattr(obj, func)
         GraphBuilder.set_default_prefix(node_id, payload["index"] or 0, 0)
+        set_preview_method(payload["extra_data"].get("preview_method"))
         registry = ProgressRegistry(payload["prompt_id"], DynamicPrompt(payload["prompt"]))
         scoped_progress_registry.set(registry)
         add_progress_handler(WebUIProgressHandler(worker_server))

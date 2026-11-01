@@ -278,7 +278,7 @@ database_default_path = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "user", "comfyui.db")
 )
 parser.add_argument("--database-url", type=str, default=None, help="Specify the database URL, e.g. for an in-memory database you can use 'sqlite:///:memory:'. Defaults to 'comfyui.db' in the effective user directory.")
-parser.add_argument("--async-workers", type=int, default=2, help="Number of concurrent workflows in isolated GPU workers. Use 0 for the upstream executor.")
+parser.add_argument("--disable-async-execution", action="store_true", help="Use the upstream serial executor instead of the resident graph scheduler.")
 parser.add_argument("--async-node-concurrency", type=int, default=None, help="Optional limit on concurrent node calls per device worker. By default, admission follows available memory. Use 1 for serial node execution.")
 parser.add_argument("--enable-assets", action="store_true", help="Enable the assets system (API routes, database synchronization, and background scanning). Off by default.")
 parser.add_argument("--disable-assets", action="store_true", help="Disable the assets system, even when --enable-assets is also given.")
@@ -294,8 +294,6 @@ else:
 if args.cache_ram is not None and len(args.cache_ram) > 2:
     parser.error("--cache-ram accepts at most two values: active GB and inactive GB")
 
-if args.async_workers < 0:
-    parser.error("--async-workers must be nonnegative")
 if args.async_node_concurrency is not None and args.async_node_concurrency < 1:
     parser.error("--async-node-concurrency must be positive")
 
