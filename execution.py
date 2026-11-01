@@ -43,6 +43,7 @@ from comfy_execution.graph_utils import GraphBuilder, is_link
 from comfy_execution.validation import LoopValidationError, validate_loops, validate_node_input
 from comfy_execution.progress import get_progress_state, reset_progress_state, add_progress_handler, WebUIProgressHandler
 from comfy_execution.utils import CurrentNodeContext
+from comfy_execution.async_execution import active_runtime
 from comfy_execution.asset_enrichment import register_executed_outputs, emit_cached_output, take_asset_previews
 from comfy_execution.media_enrichment import enrich_output_with_media_metadata
 from comfy_api.internal import _ComfyNodeInternal, _NodeOutputInternal, first_real_override, is_class, make_locked_method_func
@@ -277,6 +278,13 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                 execution_block = execution_block_cb(v) if execution_block_cb else v
                 break
         if execution_block is None:
+            runtime = active_runtime.get()
+            # Loop/control nodes mutate the live execution list and remain in the coordinator.
+            hidden = (v3_data or {}).get("hidden_inputs", {})
+            controls_graph = any(isinstance(value, ExecutionList) for value in (*inputs.values(), *hidden.values()))
+            if runtime is not None and func in (getattr(obj, "FUNCTION", None), "check_lazy_status") and not controls_graph:
+                results.append(asyncio.create_task(runtime.call(unique_id, index, func, inputs, v3_data)))
+                return
             if pre_execute_cb is not None and index is not None:
                 pre_execute_cb(index)
             # V3
@@ -756,6 +764,9 @@ class PromptExecutor:
         try:
             with torch.inference_mode():
                 dynamic_prompt = DynamicPrompt(prompt)
+                runtime = active_runtime.get()
+                if runtime is not None:
+                    runtime.dynprompt = dynamic_prompt
                 reset_progress_state(prompt_id, dynamic_prompt)
                 add_progress_handler(WebUIProgressHandler(self.server))
                 is_changed_cache = IsChangedCache(prompt_id, dynamic_prompt, self.caches.outputs)
@@ -1392,7 +1403,10 @@ class PromptQueue:
         with self.mutex:
             for item in self.currently_running.values():
                 if item[1] == prompt_id:
-                    nodes.interrupt_processing()
+                    if hasattr(self.server, "async_executor"):
+                        self.server.async_executor.interrupt(prompt_id)
+                    else:
+                        nodes.interrupt_processing()
                     return True
         return False
 

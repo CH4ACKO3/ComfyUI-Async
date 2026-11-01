@@ -426,6 +426,7 @@ class PromptServer():
                 glob.escape(self.web_root), 'extensions/**/*.js'), recursive=True)
 
             extensions = list(map(lambda f: "/" + os.path.relpath(f, self.web_root).replace("\\", "/"), files))
+            extensions.append("/async-extension/gpu_groups.js")
 
             for name, dir in nodes.EXTENSION_WEB_DIRS.items():
                 files = glob.glob(os.path.join(glob.escape(dir), '**/*.js'), recursive=True)
@@ -433,6 +434,18 @@ class PromptServer():
                     name) + "/" + os.path.relpath(f, dir).replace("\\", "/"), files)))
 
             return web.json_response(extensions)
+
+        @routes.get("/async/devices")
+        async def get_async_devices(request):
+            devices = comfy.model_management.get_all_torch_devices()
+            return web.json_response({"enabled": args.async_workers > 0, "devices": [
+                {"id": str(device), "name": comfy.model_management.torch.cuda.get_device_name(device)}
+                for device in devices if device.type == "cuda"
+            ]})
+
+        @routes.get("/async-extension/gpu_groups.js")
+        async def get_gpu_groups_extension(request):
+            return web.FileResponse(os.path.join(os.path.dirname(__file__), "web_async", "gpu_groups.js"))
 
         def get_dir_by_type(dir_type):
             if dir_type is None:
@@ -1201,6 +1214,13 @@ class PromptServer():
 
                 self.node_replace_manager.apply_replacements(prompt)
 
+                if args.async_workers:
+                    available_devices = {str(device) for device in comfy.model_management.get_all_torch_devices() if device.type == "cuda"}
+                    for node_id, node in prompt.items():
+                        devices = node.get("_meta", {}).get("gpu_devices", [])
+                        if not isinstance(devices, list) or any(not isinstance(device, str) or device not in available_devices for device in devices):
+                            return web.json_response({"error": {"type": "invalid_gpu_devices", "message": f"Node {node_id} has unavailable GPU assignments", "details": str(devices), "extra_info": {}}, "node_errors": {}}, status=400)
+
                 valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)
                 extra_data = {}
                 if "extra_data" in json_data:
@@ -1268,6 +1288,9 @@ class PromptServer():
 
             # Check if a specific prompt_id was provided for targeted interruption
             prompt_id = json_data.get('prompt_id')
+            if hasattr(self, "async_executor"):
+                await asyncio.to_thread(self.async_executor.interrupt, prompt_id)
+                return web.Response(status=200)
             if prompt_id:
                 currently_running, _ = self.prompt_queue.get_current_queue()
 

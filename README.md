@@ -1,3 +1,5 @@
+This fork adds asynchronous GPU workers and device assignment through native Groups. See [Async GPU groups](ASYNC.md) for usage and compatibility limits; `--async-workers 0` restores the upstream executor.
+
 <div align="center">
 
 # ComfyUI
