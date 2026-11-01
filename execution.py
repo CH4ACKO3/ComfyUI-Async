@@ -1331,15 +1331,23 @@ class PromptQueue:
         with self.mutex:
             heapq.heappush(self.queue, item)
             self.server.queue_updated()
-            self.not_empty.notify()
+            self.not_empty.notify_all()
 
-    def get(self, timeout=None):
+    def get(self, timeout=None, predicate=None):
         with self.not_empty:
-            while len(self.queue) == 0:
+            while True:
+                if predicate is None and self.queue:
+                    item = heapq.heappop(self.queue)
+                    break
+                eligible = [i for i, item in enumerate(self.queue) if predicate is None or predicate(item)]
+                if eligible:
+                    index = min(eligible, key=lambda i: self.queue[i])
+                    item = self.queue.pop(index)
+                    heapq.heapify(self.queue)
+                    break
                 self.not_empty.wait(timeout=timeout)
-                if timeout is not None and len(self.queue) == 0:
+                if timeout is not None and not any(predicate is None or predicate(item) for item in self.queue):
                     return None
-            item = heapq.heappop(self.queue)
             i = self.task_counter
             self.currently_running[i] = copy.deepcopy(item)
             self.task_counter += 1

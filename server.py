@@ -447,6 +447,10 @@ class PromptServer():
         async def get_gpu_groups_extension(request):
             return web.FileResponse(os.path.join(os.path.dirname(__file__), "web_async", "gpu_groups.js"))
 
+        @routes.get("/async/status")
+        async def get_async_status(request):
+            return web.json_response(self.async_executor.scheduler.snapshot() if args.async_workers else {})
+
         def get_dir_by_type(dir_type):
             if dir_type is None:
                 dir_type = "input"
@@ -1247,7 +1251,14 @@ class PromptServer():
                         if sensitive_val in extra_data:
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
                     extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
-                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+                    item = (number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive)
+                    if args.async_workers:
+                        try:
+                            self.async_executor.enqueue(item)
+                        except (ValueError, OverflowError) as exc:
+                            return web.json_response({"error": {"type": "invalid_execution_session", "message": str(exc), "details": "", "extra_info": {}}, "node_errors": {}}, status=429 if isinstance(exc, OverflowError) else 400)
+                    else:
+                        self.prompt_queue.put(item)
                     # The frontend can queue with an empty client_id before its socket id arrives.
                     if not json_data.get("client_id") and extra_data.get("comfy_usage_source") != "comfyui-frontend":
                         deploy_to_cloud.mark_used_headlessly()

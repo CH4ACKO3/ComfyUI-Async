@@ -9,13 +9,14 @@ import sys
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from contextlib import nullcontext
 from multiprocessing.connection import Client
 
 import psutil
 from filelock import FileLock
 
-from comfy_execution.async_execution import ObjectData, ObjectRef, Runtime, active_runtime, map_values
+from comfy_execution.async_execution import ObjectData, ObjectRef, Runtime, active_runtime, map_values, session_key
 
 
 def run():
@@ -52,6 +53,7 @@ def run():
     import main
     import execution
     import nodes
+    import folder_paths
     import server
     import torch
     import comfy.model_management
@@ -77,6 +79,20 @@ def run():
     ))
     main.hijack_progress(worker_server)
     comfy.model_management.set_cudnn_benchmark()
+    active_prompt = None
+    interrupt_lock = threading.Lock()
+
+    def is_cancelled(prompt_id):
+        return os.path.exists(os.path.join(config["lock_directory"], prompt_id + ".cancel"))
+
+    def watch_interrupt():
+        while True:
+            with interrupt_lock:
+                if active_prompt is not None and is_cancelled(active_prompt):
+                    nodes.interrupt_processing(True)
+            time.sleep(0.05)
+
+    threading.Thread(target=watch_interrupt, daemon=True).start()
     send(("ready", None))
 
     if config["role"] == "prompt":
@@ -84,22 +100,32 @@ def run():
         # Remote objects own their storage; the coordinator cannot measure their RAM.
         cache_type = execution.CacheType.NONE if args.cache_none else execution.CacheType.LRU
         executor = execution.PromptExecutor(worker_server, cache_type=cache_type, cache_args={"lru": args.cache_lru or 128, "ram": 0, "ram_inactive": 0}, asset_manager=NoAssets(args))
+        previous_session = None
         try:
             while True:
                 command, payload = connection.recv()
                 item = payload["item"]
                 extra_data = dict(item[3], **item[5])
+                current_session = session_key(extra_data)
+                if current_session != previous_session:
+                    executor.reset()
+                    runtime.close()
+                    runtime = Runtime(config, worker_server)
+                previous_session = current_session
                 runtime.prompt_id = item[1]
                 runtime.extra_data = extra_data
                 worker_server.last_prompt_id = item[1]
                 worker_server.workflow_metadata = extra_data.get("workflow_metadata", {})
                 worker_server.sockets_metadata = payload["sockets_metadata"]
+                with interrupt_lock:
+                    active_prompt = item[1]
                 token = active_runtime.set(runtime)
                 try:
                     loop.run_until_complete(executor.execute_async(item[2], item[1], extra_data, item[4]))
                     result = (executor.history_result, executor.success, executor.status_messages)
                     if not executor.success:
                         # Stop sibling nodes before reporting a failed workflow.
+                        runtime.request("cancel", {"prompt_id": item[1]})
                         pending = asyncio.all_tasks(loop)
                         for task in pending:
                             task.cancel()
@@ -112,6 +138,8 @@ def run():
                     send(("result", result))
                 finally:
                     active_runtime.reset(token)
+                    with interrupt_lock:
+                        active_prompt = None
         finally:
             runtime.close()
         return
@@ -119,26 +147,61 @@ def run():
     objects = {}
     instances = {}
     next_key = 0
+    leases = {}
+    model_cache = OrderedDict()
+    model_loads = 0
+    model_hits = 0
+    owner = None
+    worker_id = config["worker_id"]
+    generation = config["generation"]
+    loaders = {
+        nodes.CheckpointLoaderSimple: {"ckpt_name": "checkpoints"},
+        nodes.UNETLoader: {"unet_name": "diffusion_models"},
+        nodes.CLIPLoader: {"clip_name": "text_encoders"},
+        nodes.DualCLIPLoader: {"clip_name1": "text_encoders", "clip_name2": "text_encoders"},
+        nodes.VAELoader: {"vae_name": "vae"},
+    }
+
+    def loader_key(class_def, payload):
+        if class_def not in loaders or payload["func"] != class_def.FUNCTION:
+            return None
+        files = []
+        for name, category in loaders[class_def].items():
+            path = folder_paths.get_full_path(category, payload["inputs"][name])
+            if path is None:
+                return None
+            stat = os.stat(path)
+            files.append((path, stat.st_size, stat.st_mtime_ns))
+        recipe = json.dumps([payload["class_type"], payload["inputs"]], sort_keys=True)
+        return recipe, tuple(files)
+
+    def collect_unused():
+        keep = set().union(*leases.values()) if leases else set()
+        for key in list(objects):
+            if key not in keep:
+                del objects[key]
 
     def encode(value):
         nonlocal next_key
         if value is None or type(value) in (bool, int, float, str, bytes) or isinstance(value, ExecutionBlocker):
             return value
         if isinstance(value, torch.Tensor):
-            value = value.detach().cpu()
+            value = value.detach()
         next_key += 1
         objects[next_key] = value
-        return ObjectRef(device, next_key, isinstance(value, torch.Tensor), type(value).__name__)
+        leases.setdefault(owner, set()).add(next_key)
+        return ObjectRef(worker_id, next_key, isinstance(value, torch.Tensor), generation)
 
     def decode(value):
         if isinstance(value, ObjectRef):
+            if value.worker != worker_id or value.generation != generation:
+                raise RuntimeError("Stale GPU object reference")
+            leases.setdefault(owner, set()).add(value.key)
             return objects[value.key]
         if isinstance(value, ObjectData):
             return pickle.loads(value.data)
         return value
 
-    actual_device = config["default_device"] if device == "default" else device
-    gpu_lock = FileLock(os.path.join(config["lock_directory"], actual_device.replace(":", "-") + ".lock"))
     output_lock = FileLock(os.path.join(config["lock_directory"], "outputs.lock"))
 
     def cleanup():
@@ -146,15 +209,13 @@ def run():
             comfy.model_prefetch.cleanup_prefetch_queues()
             comfy.model_management.reset_cast_buffers()
             comfy_aimdo.model_vbar.vbars_reset_watermark_limits()
-        # Other workflow processes must be able to use this GPU after admission.
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
 
     async def call(payload):
+        nonlocal model_loads, model_hits
         class_type = payload["class_type"]
         node_id = payload["node_id"]
         class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
-        key = (node_id, class_type)
+        key = (owner, payload["session_id"], node_id, class_type)
         if key not in instances:
             instances[key] = class_def()
         obj = instances[key]
@@ -175,11 +236,21 @@ def run():
         worker_server.sockets_metadata = payload["sockets_metadata"]
         reset_progress_state(payload["prompt_id"], DynamicPrompt(payload["prompt"]))
         add_progress_handler(WebUIProgressHandler(worker_server))
-        nodes.interrupt_processing(False)
+        cache_key = loader_key(class_def, payload)
+        if cache_key in model_cache:
+            model_hits += 1
+            model_cache.move_to_end(cache_key)
+            return map_values(tuple(value.clone() if value is not None else None for value in model_cache[cache_key]), encode)
         with CurrentNodeContext(payload["prompt_id"], node_id, payload["index"]):
             # Inference state is process-local, so preserve the executor's scope here.
             with torch.inference_mode():
                 result = await f(**inputs) if inspect.iscoroutinefunction(f) else f(**inputs)
+        if cache_key is not None:
+            model_loads += 1
+            model_cache[cache_key] = result
+            while len(model_cache) > 8:
+                model_cache.popitem(last=False)
+            result = tuple(value.clone() if value is not None else None for value in result)
         if isinstance(result, _NodeOutputInternal):
             output = result.result
             if result.block_execution is not None:
@@ -197,36 +268,50 @@ def run():
     while True:
         command, payload = connection.recv()
         try:
+            owner = payload.get("owner")
             if command == "export":
-                result = ObjectData(pickle.dumps(objects[payload], protocol=pickle.HIGHEST_PROTOCOL))
-            elif command == "trim":
-                keep = set(payload["objects"])
-                for key in list(objects):
-                    if key not in keep:
-                        del objects[key]
-                keep_nodes = set(payload["nodes"])
+                result = ObjectData(pickle.dumps(objects[payload["ref"].key].detach().cpu(), protocol=pickle.HIGHEST_PROTOCOL))
+            elif command in ("trim", "release"):
+                if command == "release":
+                    leases.pop(owner, None)
+                else:
+                    leases[owner] = {ref.key for ref in payload["objects"] if ref.worker == worker_id and ref.generation == generation}
                 for key in list(instances):
-                    if key not in keep_nodes:
+                    if key[0] == owner and (command == "release" or key[1] != payload["session_id"] or key[2:] not in payload["nodes"]):
                         del instances[key]
+                collect_unused()
                 result = None
             else:
                 class_def = nodes.NODE_CLASS_MAPPINGS[payload["class_type"]]
                 is_output = getattr(class_def, "OUTPUT_NODE", False)
                 attempts = 3 if getattr(class_def, "ASYNC_RETRY_SAFE", False) and not is_output else 1
-                for attempt in range(attempts):
-                    try:
-                        with gpu_lock, output_lock if is_output else nullcontext():
-                            try:
-                                result = loop.run_until_complete(call(payload))
-                            finally:
-                                cleanup()
-                        break
-                    except Exception as exc:
-                        if not comfy.model_management.is_oom(exc) or attempt + 1 == attempts:
-                            raise
-                        time.sleep(0.1 * (2 ** attempt))
-            send(("result", result))
-        except Exception:
+                with interrupt_lock:
+                    active_prompt = payload["prompt_id"]
+                    nodes.interrupt_processing(is_cancelled(active_prompt))
+                try:
+                    for attempt in range(attempts):
+                        try:
+                            with output_lock if is_output else nullcontext():
+                                nodes.before_node_execution()
+                                try:
+                                    result = loop.run_until_complete(call(payload))
+                                finally:
+                                    cleanup()
+                            break
+                        except Exception as exc:
+                            if comfy.model_management.is_oom(exc):
+                                comfy.model_management.unload_all_models()
+                                comfy.model_management.soft_empty_cache()
+                            if not comfy.model_management.is_oom(exc) or attempt + 1 == attempts or is_cancelled(active_prompt):
+                                raise
+                            time.sleep(0.1 * (2 ** attempt))
+                finally:
+                    with interrupt_lock:
+                        active_prompt = None
+            stats = {"model_loads": model_loads, "model_hits": model_hits,
+                     "model_keys": [key[0] for key in model_cache], "objects": len(objects), "owners": len(leases)}
+            send(("result", {"value": result, "stats": stats}))
+        except (Exception, comfy.model_management.InterruptProcessingException):
             send(("error", traceback.format_exc()))
 
 

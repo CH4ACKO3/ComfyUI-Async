@@ -3,6 +3,7 @@
 import asyncio
 import atexit
 import contextvars
+import heapq
 import json
 import logging
 import os
@@ -13,8 +14,9 @@ import tempfile
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
-from multiprocessing.connection import Listener
+from multiprocessing.connection import Client, Listener
 
 import psutil
 
@@ -27,7 +29,7 @@ class ObjectRef:
     worker: str
     key: int
     transferable: bool
-    type_name: str
+    generation: str
 
 
 @dataclass
@@ -47,6 +49,11 @@ def map_values(value, visit):
     if type(value) is tuple:
         return tuple(map_values(v, visit) for v in value)
     return visit(value)
+
+
+def session_key(extra_data):
+    session = extra_data.get("execution_session")
+    return (extra_data.get("client_id", ""), session["id"]) if session else None
 
 
 class Worker:
@@ -142,9 +149,7 @@ class Runtime:
     def __init__(self, config, server):
         self.config = config
         self.server = server
-        self.workers = {}
-        self.locks = {}
-        self.pending = {}
+        self.owner = config["owner"]
         self.refs = weakref.WeakValueDictionary()
         self.dynprompt = None
         self.prompt_id = None
@@ -152,96 +157,48 @@ class Runtime:
 
     def intern(self, value):
         if isinstance(value, ObjectRef):
-            key = (value.worker, value.key)
-            value = self.refs.setdefault(key, value)
+            value = self.refs.setdefault((value.worker, value.generation, value.key), value)
         return value
 
-    def devices_for(self, node_id):
-        root_id = self.dynprompt.get_real_node_id(node_id)
-        return self.dynprompt.get_node(root_id).get("_meta", {}).get("gpu_devices", [])
-
-    def select(self, node_id, inputs):
-        owners = set()
-
-        def collect(value):
-            if isinstance(value, ObjectRef) and not value.transferable:
-                owners.add(value.worker)
-            return value
-
-        map_values(inputs, collect)
-        devices = self.devices_for(node_id)
-        if len(owners) > 1:
-            raise WorkerError("This node combines model/custom objects from different workers. Put their loaders and consumers in the same GPU group.")
-        if owners:
-            owner = owners.pop()
-            actual = self.config["default_device"] if owner == "default" else owner
-            if devices and actual not in devices:
-                raise WorkerError(f"Node {node_id} is assigned to {devices}, but its model/custom object belongs to {actual}. Put the loader in the same GPU group, or use a separate loader for each GPU.")
-            return owner
-        if not devices:
-            return "default"
-        return min(devices, key=lambda device: self.pending.get(device, 0))
-
-    def worker(self, device):
-        if device not in self.workers:
-            config = dict(self.config, role="node", device=device)
-            self.workers[device] = Worker(config, self.server.send_sync)
-            self.locks[device] = asyncio.Lock()
-        return self.workers[device]
-
-    async def request(self, device, command, payload):
-        worker = self.worker(device)
-        async with self.locks[device]:
-            return await asyncio.to_thread(worker.request, command, payload)
+    def request(self, command, payload):
+        with Client(tuple(self.config["broker_address"]), authkey=bytes.fromhex(self.config["broker_authkey"])) as connection:
+            connection.send((command, payload))
+            kind, result = connection.recv()
+        if kind == "error":
+            if command == "call" and self.prompt_id and os.path.exists(os.path.join(self.config["lock_directory"], self.prompt_id + ".cancel")):
+                # Imported here because model_management imports execution helpers during startup.
+                from comfy.model_management import InterruptProcessingException
+                raise InterruptProcessingException()
+            raise WorkerError(result)
+        return result
 
     async def call(self, node_id, index, func, inputs, v3_data):
-        device = self.select(node_id, inputs)
-        self.pending[device] = self.pending.get(device, 0) + 1
-        try:
-            transfers = {}
-
-            def collect(value):
-                if isinstance(value, ObjectRef) and value.worker != device:
-                    transfers[(value.worker, value.key)] = value
-                return value
-
-            map_values(inputs, collect)
-            for key, ref in list(transfers.items()):
-                if not ref.transferable:
-                    raise WorkerError(f"Cannot transfer {ref.type_name} between GPU workers")
-                transfers[key] = await self.request(ref.worker, "export", ref.key)
-
-            def transfer(value):
-                if isinstance(value, ObjectRef) and value.worker != device:
-                    return transfers[(value.worker, value.key)]
-                return value
-
-            payload = {
-                "prompt_id": self.prompt_id,
-                "node_id": node_id,
-                "index": index,
-                "class_type": self.dynprompt.get_node(node_id)["class_type"],
-                "func": func,
-                "inputs": map_values(inputs, transfer),
-                "v3_data": v3_data,
-                "prompt": self.dynprompt.original_prompt,
-                "extra_data": self.extra_data,
-                "sockets_metadata": self.server.sockets_metadata,
-            }
-            result = await self.request(device, "call", payload)
-            return map_values(result, self.intern)
-        finally:
-            self.pending[device] -= 1
+        root_id = self.dynprompt.get_real_node_id(node_id)
+        payload = {
+            "owner": self.owner,
+            "session_id": session_key(self.extra_data),
+            "prompt_id": self.prompt_id,
+            "node_id": node_id,
+            "index": index,
+            "class_type": self.dynprompt.get_node(node_id)["class_type"],
+            "devices": self.dynprompt.get_node(root_id).get("_meta", {}).get("gpu_devices", []),
+            "func": func,
+            "inputs": inputs,
+            "v3_data": v3_data,
+            "prompt": self.dynprompt.original_prompt,
+            "extra_data": self.extra_data,
+            "sockets_metadata": self.server.sockets_metadata,
+        }
+        result = await asyncio.to_thread(self.request, "call", payload)
+        return map_values(result, self.intern)
 
     def trim(self):
         nodes = [(node_id, self.dynprompt.get_node(node_id)["class_type"]) for node_id in self.dynprompt.all_node_ids()]
-        for device, worker in self.workers.items():
-            keys = [key for owner, key in self.refs.keys() if owner == device]
-            worker.request("trim", {"objects": keys, "nodes": nodes})
+        self.request("trim", {"owner": self.owner, "objects": list(self.refs.values()), "nodes": nodes,
+                              "session_id": session_key(self.extra_data)})
 
     def close(self):
-        for worker in self.workers.values():
-            worker.close()
+        self.request("release", {"owner": self.owner})
 
 
 class AsyncExecutorPool:
@@ -250,45 +207,104 @@ class AsyncExecutorPool:
         self.queue = queue
         self.asset_manager = asset_manager
         self.slots = slots
-        self.default_device = default_device
         self.directory = tempfile.TemporaryDirectory(prefix="comfy-gpu-")
         self.running = {}
         self.idle = set()
-        self.generation = 0
         self.cancelled = set()
+        self.clear_requested = False
+        self.revisions = OrderedDict()
+        self.session_slots = {}
+        from comfy_execution.async_scheduler import DeviceScheduler
+        self.scheduler = DeviceScheduler(self.directory.name, default_device, server.send_sync)
         self.stopping = threading.Event()
-        self.mutex = threading.Lock()
+        self.mutex = threading.RLock()
         atexit.register(self.shutdown)
 
     def interrupt(self, prompt_id=None):
         with self.queue.mutex, self.mutex:
             ids = {item[1] for item in self.queue.currently_running.values() if prompt_id is None or item[1] == prompt_id}
             self.cancelled.update(ids)
-            workers = [worker for key, worker in self.running.items() if key in ids]
-            for worker in workers:
-                worker.closed = True
-        for worker in workers:
-            worker.close()
+            for key in ids:
+                with open(os.path.join(self.directory.name, key + ".cancel"), "w"):
+                    pass
 
     def clear(self):
         with self.mutex:
-            self.generation += 1
-            workers = list(self.idle)
-            for worker in workers:
-                worker.closed = True
-        for worker in workers:
-            worker.close()
+            if self.running:
+                self.clear_requested = True
+                return
+            self.clear_requested = False
+            for worker in self.idle:
+                worker.close()
+            self.idle.clear()
+            self.scheduler.clear()
 
     def shutdown(self):
         self.stopping.set()
         self.interrupt()
-        self.clear()
+        with self.mutex:
+            workers = list(self.running.values()) + list(self.idle)
+        for worker in workers:
+            worker.close()
+        self.scheduler.close()
 
     def start(self):
         for index in range(self.slots):
-            threading.Thread(target=self.run_slot, name=f"prompt-{index}", daemon=True).start()
+            threading.Thread(target=self.run_slot, args=(index,), name=f"prompt-{index}", daemon=True).start()
 
-    def run_slot(self):
+    def enqueue(self, item):
+        # Queue ownership makes revision checks and replacement atomic with dequeue.
+        import execution
+
+        session = item[3].get("execution_session")
+        if session is None:
+            self.queue.put(item)
+            return
+        if (not isinstance(session, dict) or not isinstance(session.get("id"), str)
+                or not 1 <= len(session["id"]) <= 128 or type(session.get("revision")) is not int
+                or session["revision"] < 0 or session.get("policy", "latest") not in ("latest", "fifo")):
+            raise ValueError("execution_session requires id, nonnegative integer revision and latest/fifo policy")
+        session = item[3]["execution_session"] = {"id": session["id"], "revision": session["revision"], "policy": session.get("policy", "latest")}
+        key = session_key(item[3])
+        with self.queue.mutex:
+            if session["revision"] <= self.revisions.get(key, -1):
+                raise ValueError("execution_session revision must increase")
+            pending = [queued for queued in self.queue.queue if session_key(queued[3]) == key]
+            if session["policy"] == "fifo" and len(pending) >= 64:
+                raise OverflowError("Execution session has 64 pending inputs; wait before submitting more")
+            if key not in self.revisions and len(self.revisions) >= 256:
+                active = {session_key(queued[3]) for queued in self.queue.queue + list(self.queue.currently_running.values())}
+                oldest = next((candidate for candidate in self.revisions if candidate not in active), None)
+                if oldest is None:
+                    raise OverflowError("Too many active execution sessions")
+                del self.revisions[oldest]
+                del self.session_slots[oldest]
+            if key not in self.session_slots:
+                assigned = [self.session_slots.get(session_key(queued[3])) for queued in self.queue.queue + list(self.queue.currently_running.values())]
+                self.session_slots[key] = min(range(self.slots), key=lambda slot: (assigned.count(slot), list(self.session_slots.values()).count(slot)))
+            self.revisions[key] = session["revision"]
+            self.revisions.move_to_end(key)
+            if session["policy"] == "latest":
+                for queued in pending:
+                    self.queue.queue.remove(queued)
+                heapq.heapify(self.queue.queue)
+            self.queue.put(item)
+            if session["policy"] == "latest":
+                for queued in pending:
+                    details = {"prompt_id": queued[1], "execution_session": queued[3]["execution_session"], "replacement_prompt_id": item[1], "timestamp": int(time.time() * 1000)}
+                    item_id = self.queue.task_counter
+                    self.queue.task_counter += 1
+                    self.queue.currently_running[item_id] = queued
+                    self.queue.task_done(item_id, {}, execution.PromptQueue.ExecutionStatus("error", False, [("execution_superseded", details)]), process_item=lambda prompt: prompt[:5])
+                    self.server.send_sync("execution_superseded", details, item[3].get("client_id"))
+
+    def accepts(self, item, slot):
+        key = session_key(item[3])
+        if key is None:
+            return True
+        return self.session_slots[key] == slot
+
+    def run_slot(self, slot):
         # Import here to avoid the execution -> async_execution -> execution cycle.
         import execution
         from comfy_execution.asset_enrichment import register_executed_outputs
@@ -299,7 +315,7 @@ class AsyncExecutorPool:
             flags = self.queue.get_flags()
             if flags.get("free_memory") or flags.get("unload_models"):
                 self.clear()
-            queued = self.queue.get(timeout=0.5)
+            queued = self.queue.get(timeout=0.5, predicate=lambda item: self.accepts(item, slot))
             if queued is None:
                 continue
             item, item_id = queued
@@ -308,6 +324,8 @@ class AsyncExecutorPool:
 
             def forward(event, data, sid=None):
                 metadata = item[3].get("workflow_metadata", {})
+                if "execution_session" in item[3]:
+                    metadata = {**metadata, "execution_session": item[3]["execution_session"]}
                 if isinstance(data, dict) and "prompt_id" in data:
                     data = {**metadata, **data}
                     if event == "executed":
@@ -321,12 +339,10 @@ class AsyncExecutorPool:
                     return
                 self.idle.discard(worker)
                 if worker is None or worker.closed:
-                    worker = Worker({"role": "prompt", "lock_directory": self.directory.name, "default_device": self.default_device}, forward)
+                    worker = Worker({"role": "prompt", "owner": secrets.token_hex(16), "lock_directory": self.directory.name, **self.scheduler.config}, forward)
                 worker.send_event = forward
-                generation = self.generation
                 self.running[prompt_id] = worker
-                if prompt_id in self.cancelled:
-                    worker.closed = True
+                self.scheduler.routes[prompt_id] = forward
             self.asset_manager.pause_background_scan()
             try:
                 result = worker.request("prompt", {"item": item, "sockets_metadata": self.server.sockets_metadata})
@@ -334,18 +350,20 @@ class AsyncExecutorPool:
                 history["outputs"] = {node_id: register_executed_outputs(output, prompt_id, self.asset_manager) for node_id, output in history["outputs"].items()}
             except Exception as exc:
                 logging.exception("Async prompt %s failed", prompt_id)
-                event = "execution_interrupted" if worker.closed else "execution_error"
+                event = "execution_interrupted" if prompt_id in self.cancelled else "execution_error"
                 details = {"prompt_id": prompt_id, "node_id": None, "node_type": "", "executed": [], "exception_message": str(exc), "exception_type": type(exc).__name__, "traceback": [], "timestamp": int(time.time() * 1000)}
                 forward(event, details, client_id)
                 history, success, messages = {}, False, [(event, details)]
+                self.scheduler.request("cancel", {"prompt_id": prompt_id})
                 worker.close()
+                self.scheduler.request("release", {"owner": worker.config["owner"]})
             finally:
                 with self.mutex:
                     self.running.pop(prompt_id, None)
                     self.idle.add(worker)
-                    discard = generation != self.generation
-                if discard:
-                    worker.close()
+                    self.scheduler.routes.pop(prompt_id, None)
+                    if self.clear_requested:
+                        self.clear()
             self.queue.task_done(item_id, history, status=execution.PromptQueue.ExecutionStatus(status_str="success" if success else "error", completed=success, messages=messages), process_item=lambda prompt: prompt[:5] + prompt[6:])
             with self.mutex:
                 self.cancelled.discard(prompt_id)
