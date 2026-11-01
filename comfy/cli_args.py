@@ -278,7 +278,6 @@ database_default_path = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "user", "comfyui.db")
 )
 parser.add_argument("--database-url", type=str, default=None, help="Specify the database URL, e.g. for an in-memory database you can use 'sqlite:///:memory:'. Defaults to 'comfyui.db' in the effective user directory.")
-parser.add_argument("--disable-async-execution", action="store_true", help="Use the upstream serial executor instead of the resident graph scheduler.")
 parser.add_argument("--async-node-concurrency", type=int, default=None, help="Optional limit on concurrent node calls per device worker. By default, admission follows available memory. Use 1 for serial node execution.")
 parser.add_argument("--enable-assets", action="store_true", help="Enable the assets system (API routes, database synchronization, and background scanning). Off by default.")
 parser.add_argument("--disable-assets", action="store_true", help="Disable the assets system, even when --enable-assets is also given.")

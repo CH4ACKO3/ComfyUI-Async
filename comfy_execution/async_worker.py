@@ -17,7 +17,7 @@ from multiprocessing.connection import Client
 import psutil
 from filelock import FileLock
 
-from comfy_execution.async_execution import BrokerChannel, ObjectData, ObjectRef, Runtime, active_runtime, map_values, session_key
+from comfy_execution.async_execution import BrokerChannel, ObjectData, ObjectRef, Runtime, active_runtime, map_values, graph_key
 
 
 call_payload = contextvars.ContextVar("worker_call_payload", default=None)
@@ -147,7 +147,7 @@ def run():
     threading.Thread(target=watch_interrupt, daemon=True).start()
     send(("ready", None))
 
-    if config["role"] == "prompt":
+    if config["role"] == "graph":
         from comfy_execution.resident_graph import ResidentGraph, RevisionCache
 
         graphs = OrderedDict()
@@ -162,37 +162,35 @@ def run():
             interrupt_token = comfy.model_management.processing_interrupt_event.set(interrupted)
             with interrupt_lock:
                 active_calls[request_id] = (item[1], interrupted)
-            runtime = Runtime(dict(config, owner=graph.owner), worker_server, channel)
+            runtime = Runtime(dict(config, owner=graph.owner), worker_server, channel, graph, interrupted)
             runtime.prompt_id, runtime.extra_data = item[1], extra_data
             runtime_token = active_runtime.set(runtime)
             scoped_progress_registry.set(ProgressRegistry(item[1], DynamicPrompt(item[2])))
-            executor = execution.PromptExecutor(worker_server, cache_type=execution.CacheType.NONE if args.cache_none else execution.CacheType.LRU,
+            executor = execution.PromptExecutor(worker_server, cache_type=execution.CacheType.LRU,
                                                 cache_args={"lru": graph.cache_size, "ram": 0, "ram_inactive": 0}, asset_manager=NoAssets(args))
-            if not args.cache_none:
-                executor.caches.outputs = RevisionCache(graph)
-                executor.caches.all = [executor.caches.outputs, executor.caches.objects]
+            executor.caches.outputs = RevisionCache(graph, extra_data["graph_event"]["revision"])
+            executor.caches.all = [executor.caches.outputs, executor.caches.objects]
             try:
                 await executor.execute_async(item[2], item[1], extra_data, item[4])
-                if not executor.success:
-                    cancelled = is_cancelled(item[1])
-                    await asyncio.wrap_future(channel.submit("cancel", {"prompt_id": item[1]}))
-                    for task in runtime.tasks:
-                        task.cancel()
-                    await asyncio.gather(*runtime.tasks, return_exceptions=True)
-                    if not cancelled:
-                        graph.outputs.clear()
                 result = (executor.history_result, executor.success, executor.status_messages)
                 response = ("result", (request_id, result))
             except (Exception, comfy.model_management.InterruptProcessingException):
-                graph.outputs.clear()
                 response = ("error", (request_id, traceback.format_exc()))
             finally:
                 try:
+                    if response[0] == "error" or not executor.success:
+                        await asyncio.wrap_future(channel.submit("cancel", {"prompt_id": item[1]}))
+                        for task in runtime.tasks:
+                            task.cancel()
+                        await asyncio.gather(*runtime.tasks, return_exceptions=True)
                     async with graph.gate:
                         graph.active -= 1
+                        graph.views.discard(executor.caches.outputs)
+                        graph.prune()
+                        await graph.retire(channel)
                         if not graph.active:
                             await asyncio.wrap_future(channel.submit("trim", {
-                                "owner": graph.owner, "objects": graph.references(), "session_id": session_key(extra_data),
+                                "owner": graph.owner, "objects": graph.references(), "graph_key": graph_key(extra_data),
                                 "nodes": [(node_id, node["class_type"]) for node_id, node in graph.prompt.items()],
                             }))
                 except Exception:
@@ -208,13 +206,15 @@ def run():
             while True:
                 request_id, command, payload = await asyncio.to_thread(connection.recv)
                 item = payload["item"]
-                key = session_key(item[3]) or (item[3].get("client_id", ""), None)
+                key = graph_key(item[3])
                 if key not in graphs:
-                    graphs[key] = ResidentGraph(args.cache_lru or 128)
+                    graphs[key] = ResidentGraph(0 if args.cache_none else args.cache_lru or 128)
                 graph = graphs[key]
                 graphs.move_to_end(key)
                 async with graph.gate:
-                    graph.prompt = item[2]
+                    if item[3]["graph_event"]["revision"] > graph.revision:
+                        graph.prompt = item[2]
+                        graph.revision = item[3]["graph_event"]["revision"]
                     graph.active += 1
                 task = asyncio.create_task(revise(request_id, payload, graph))
                 tasks.add(task)
@@ -367,7 +367,7 @@ def run():
         interrupt_token = comfy.model_management.processing_interrupt_event.set(interrupted)
         with interrupt_lock:
             active_calls[request_id] = (payload["prompt_id"], interrupted)
-        key = (payload["owner"], payload["session_id"], payload["node_id"], payload["class_type"])
+        key = (payload["owner"], payload["graph_key"], payload["node_id"], payload["class_type"])
         obj = None
         stream = None
         try:
@@ -434,7 +434,13 @@ def run():
             # Keep only one new call waiting for memory or an exclusive node.
             admitted.wait()
             continue
-        # Objects are exported or retired only after earlier calls finish.
+        if command == "retire":
+            with state_lock:
+                leases.get(payload["owner"], set()).difference_update(ref.key for ref in payload["objects"] if ref.worker == worker_id and ref.generation == generation)
+                collect_unused()
+            send(("result", (request_id, {"value": None, "stats": stats()})))
+            continue
+        # Exports and bulk owner cleanup wait for earlier calls.
         for thread in pending:
             thread.join()
         pending.clear()
@@ -448,7 +454,7 @@ def run():
                 else:
                     leases[owner] = {ref.key for ref in payload["objects"] if ref.worker == worker_id and ref.generation == generation}
                 for key in list(instances):
-                    if key[0] == owner and (command == "release" or key[1] != payload["session_id"] or key[2:] not in payload["nodes"]):
+                    if key[0] == owner and (command == "release" or key[1] != payload["graph_key"] or key[2:] not in payload["nodes"]):
                         del instances[key]
                 collect_unused()
                 result = None

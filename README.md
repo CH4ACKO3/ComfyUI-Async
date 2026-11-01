@@ -1,4 +1,4 @@
-This fork adds asynchronous GPU workers and device assignment through native Groups. See [Async GPU groups](ASYNC.md) for usage and compatibility limits; `--disable-async-execution` restores the upstream executor.
+This fork adds asynchronous GPU workers and device assignment through native Groups. See [Async GPU groups](ASYNC.md) for graph events, device assignment and execution limits.
 
 <div align="center">
 

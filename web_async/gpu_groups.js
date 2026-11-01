@@ -2,7 +2,6 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 let devices = [];
-let enabled = false;
 
 function selectedDevices(group) {
     return group.flags?.gpu_devices ?? devices.map(({ id }) => id);
@@ -11,7 +10,6 @@ function selectedDevices(group) {
 app.registerExtension({
     name: "Comfy.Async.GPUGroups",
     getCanvasMenuItems(canvas) {
-        if (!enabled) return [];
         const group = canvas.graph?.getGroupOnPos(...canvas.graph_mouse);
         if (!group) return [];
         return [{
@@ -68,8 +66,7 @@ app.registerExtension({
     async setup() {
         const response = await api.fetchApi("/async/devices");
         if (!response.ok) return;
-        ({ enabled, devices } = await response.json());
-        if (!enabled) return;
+        ({ devices } = await response.json());
 
         const draw = LiteGraph.LGraphGroup.prototype.draw;
         LiteGraph.LGraphGroup.prototype.draw = function (canvas, ctx) {

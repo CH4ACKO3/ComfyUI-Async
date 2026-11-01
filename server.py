@@ -8,6 +8,7 @@ import time
 import nodes
 import folder_paths
 import execution
+from comfy_execution.async_execution import GraphRevisionError
 from comfy_execution.jobs import (
     JobStatus,
     get_job,
@@ -331,7 +332,6 @@ class PromptServer():
         self.client_id = None
         self.workflow_metadata = {}
 
-        self.on_prompt_handlers = []
 
         @routes.get('/ws')
         async def websocket_handler(request):
@@ -426,7 +426,7 @@ class PromptServer():
                 glob.escape(self.web_root), 'extensions/**/*.js'), recursive=True)
 
             extensions = list(map(lambda f: "/" + os.path.relpath(f, self.web_root).replace("\\", "/"), files))
-            extensions.append("/async-extension/gpu_groups.js")
+            extensions.extend(["/async-extension/gpu_groups.js", "/async-extension/graph_events.js"])
 
             for name, dir in nodes.EXTENSION_WEB_DIRS.items():
                 files = glob.glob(os.path.join(glob.escape(dir), '**/*.js'), recursive=True)
@@ -438,18 +438,18 @@ class PromptServer():
         @routes.get("/async/devices")
         async def get_async_devices(request):
             devices = comfy.model_management.get_all_torch_devices()
-            return web.json_response({"enabled": not args.disable_async_execution, "devices": [
+            return web.json_response({"devices": [
                 {"id": str(device), "name": comfy.model_management.torch.cuda.get_device_name(device)}
                 for device in devices if device.type == "cuda"
             ]})
 
-        @routes.get("/async-extension/gpu_groups.js")
-        async def get_gpu_groups_extension(request):
-            return web.FileResponse(os.path.join(os.path.dirname(__file__), "web_async", "gpu_groups.js"))
+        @routes.get("/async-extension/{name:gpu_groups|graph_events}.js")
+        async def get_async_extension(request):
+            return web.FileResponse(os.path.join(os.path.dirname(__file__), "web_async", request.match_info["name"] + ".js"))
 
         @routes.get("/async/status")
         async def get_async_status(request):
-            return web.json_response(self.async_executor.scheduler.snapshot() if not args.disable_async_execution else {})
+            return web.json_response(self.async_executor.scheduler.snapshot())
 
         def get_dir_by_type(dir_type):
             if dir_type is None:
@@ -1178,111 +1178,96 @@ class PromptServer():
             queue_info['queue_pending'] = _remove_sensitive_from_queue(current_queue[1])
             return web.json_response(queue_info)
 
-        @routes.post("/prompt")
-        async def post_prompt(request):
-            logging.info("got prompt")
-            json_data =  await request.json()
-            refresh_base = None
-            if "refresh" in json_data:
-                if args.disable_async_execution or "prompt" in json_data:
-                    return web.json_response({"error": "Node refresh requires the resident graph scheduler and no prompt field"}, status=400)
-                try:
-                    json_data["prompt"], refresh_base = self.async_executor.expand_refresh(json_data)
-                except (ValueError, TypeError) as exc:
-                    return web.json_response({"error": str(exc)}, status=400)
-            json_data = self.trigger_on_prompt(json_data)
+        def graph_request_key(request, data):
+            graph_id = validate_job_id(request.match_info["graph_id"])
+            client_id = data.get("client_id", "")
+            if not isinstance(client_id, str):
+                raise ValueError("client_id must be a string")
+            return client_id, graph_id
 
-            if "number" in json_data:
-                number = float(json_data['number'])
-            else:
-                number = self.number
-                if "front" in json_data:
-                    if json_data['front']:
-                        number = -number
+        def graph_error(message, status=400):
+            return web.json_response({"error": {"type": "invalid_graph_event", "message": str(message), "details": "", "extra_info": {}}, "node_errors": {}}, status=status)
 
-                self.number += 1
+        def check_nodes(prompt):
+            if not isinstance(prompt, dict):
+                raise ValueError("nodes must map node IDs to definitions")
+            available = {str(device) for device in comfy.model_management.get_all_torch_devices() if device.type == "cuda"}
+            for node_id, node in prompt.items():
+                if node is None:
+                    continue
+                if not isinstance(node, dict) or not isinstance(node.get("class_type"), str) or not isinstance(node.get("inputs"), dict) or not isinstance(node.get("_meta", {}), dict):
+                    raise ValueError(f"Invalid definition for node {node_id}")
+                meta = node.get("_meta", {})
+                meta.pop("input_revision", None)
+                devices = meta.get("gpu_devices", [])
+                if not isinstance(devices, list) or any(not isinstance(device, str) or device not in available for device in devices):
+                    raise ValueError(f"Node {node_id} has unavailable GPU assignments")
 
-            if "prompt" in json_data:
-                prompt = json_data["prompt"]
-                client_prompt_id = json_data.get("prompt_id")
-                if client_prompt_id is None:
-                    # Absent or explicit null: the server mints the id.
-                    prompt_id = str(uuid.uuid4())
-                else:
-                    try:
-                        prompt_id = validate_job_id(client_prompt_id)
-                    except ValueError:
-                        error = {
-                            "type": "invalid_prompt_id",
-                            "message": "prompt_id must be a valid UUID",
-                            "details": "prompt_id must be a UUID string in canonical lowercase hyphenated form; omit it to let the server generate one",
-                            "extra_info": {}
-                        }
-                        return web.json_response({"error": error, "node_errors": {}}, status=400)
-
-                partial_execution_targets = None
-                if "partial_execution_targets" in json_data:
-                    partial_execution_targets = json_data["partial_execution_targets"]
-
+        @routes.put("/graphs/{graph_id}")
+        async def register_graph(request):
+            data = await request.json()
+            try:
+                key = graph_request_key(request, data)
+                prompt = data["nodes"]
+                check_nodes(prompt)
+                if any(node is None for node in prompt.values()):
+                    raise ValueError("Registered nodes require definitions")
                 self.node_replace_manager.apply_replacements(prompt)
+                self.async_executor.register_graph(key, prompt)
+            except (ValueError, TypeError, KeyError) as exc:
+                return graph_error(exc)
+            return web.json_response({"graph_id": key[1], "revision": 0})
 
-                if not args.disable_async_execution:
-                    available_devices = {str(device) for device in comfy.model_management.get_all_torch_devices() if device.type == "cuda"}
-                    for node_id, node in prompt.items():
-                        devices = node.get("_meta", {}).get("gpu_devices", [])
-                        if not isinstance(devices, list) or any(not isinstance(device, str) or device not in available_devices for device in devices):
-                            return web.json_response({"error": {"type": "invalid_gpu_devices", "message": f"Node {node_id} has unavailable GPU assignments", "details": str(devices), "extra_info": {}}, "node_errors": {}}, status=400)
-
-                valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)
-                extra_data = {}
-                if "extra_data" in json_data:
-                    extra_data = json_data["extra_data"]
-
-                if "client_id" in json_data:
-                    extra_data["client_id"] = json_data["client_id"]
-
-                extra_data.pop("workflow_metadata", None)
-                metadata = valid_workflow_metadata(json_data)
-                if metadata is None:
-                    metadata = workflow_metadata_from_prompt(extra_data)
-                if metadata is not None:
-                    extra_data["workflow_metadata"] = metadata
-
-                if "comfy_usage_source" not in extra_data:
-                    usage_source = request.headers.get("Comfy-Usage-Source")
-                    if usage_source:
-                        extra_data["comfy_usage_source"] = usage_source
-                if valid[0]:
-                    outputs_to_execute = valid[2]
-                    sensitive = {}
-                    for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
-                        if sensitive_val in extra_data:
-                            sensitive[sensitive_val] = extra_data.pop(sensitive_val)
-                    extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
-                    item = (number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive)
-                    if not args.disable_async_execution:
-                        try:
-                            self.async_executor.enqueue(item, base_revision=refresh_base)
-                        except (ValueError, OverflowError) as exc:
-                            return web.json_response({"error": {"type": "invalid_execution_session", "message": str(exc), "details": "", "extra_info": {}}, "node_errors": {}}, status=429 if isinstance(exc, OverflowError) else 400)
-                    else:
-                        self.prompt_queue.put(item)
-                    # The frontend can queue with an empty client_id before its socket id arrives.
-                    if not json_data.get("client_id") and extra_data.get("comfy_usage_source") != "comfyui-frontend":
-                        deploy_to_cloud.mark_used_headlessly()
-                    response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
+        @routes.get("/graphs/{graph_id}")
+        async def get_graph(request):
+            try:
+                key = graph_request_key(request, request.query)
+                with self.prompt_queue.mutex:
+                    response = {"graph_id": key[1], "revision": self.async_executor.revisions[key], "nodes": self.async_executor.frames[key]}
                     return web.json_response(response)
-                else:
-                    logging.warning("invalid prompt: {}".format(valid[1]))
-                    return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
-            else:
-                error = {
-                    "type": "no_prompt",
-                    "message": "No prompt provided",
-                    "details": "No prompt provided",
-                    "extra_info": {}
-                }
-                return web.json_response({"error": error, "node_errors": {}}, status=400)
+            except KeyError:
+                return graph_error("Graph not found", 404)
+            except ValueError as exc:
+                return graph_error(exc)
+
+        @routes.post("/graphs/{graph_id}/events")
+        async def post_graph_event(request):
+            data = await request.json()
+            try:
+                key = graph_request_key(request, data)
+                event_id = validate_job_id(data["event_id"])
+                changes = data.get("changes", {})
+                check_nodes(changes)
+                base_revision = data["base_revision"]
+                prompt, revision, changed, affected, targets = self.async_executor.prepare_event(key, base_revision, changes, data.get("refresh", []))
+                extra_data = dict(data.get("extra_data", {}))
+                extra_data["client_id"] = key[0]
+                extra_data["graph_event"] = {"graph_id": key[1], "revision": revision, "event_id": event_id, "changed_nodes": changed}
+                number = float(data.get("number", self.number))
+            except KeyError as exc:
+                return graph_error(exc, 404)
+            except GraphRevisionError as exc:
+                return graph_error(exc, 409)
+            except (ValueError, TypeError) as exc:
+                return graph_error(exc)
+            self.node_replace_manager.apply_replacements(prompt)
+            targets.extend(node_id for node_id in affected if node_id not in targets and getattr(nodes.NODE_CLASS_MAPPINGS.get(prompt[node_id]["class_type"]), "OUTPUT_NODE", False))
+            valid = await execution.validate_prompt(event_id, prompt, list(affected)) if affected else (True, None, [], {})
+            if not valid[0] or valid[3]:
+                return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
+            extra_data.pop("workflow_metadata", None)
+            metadata = valid_workflow_metadata(data) or workflow_metadata_from_prompt(extra_data)
+            if metadata is not None:
+                extra_data["workflow_metadata"] = metadata
+            sensitive = {name: extra_data.pop(name) for name in execution.SENSITIVE_EXTRA_DATA_KEYS if name in extra_data}
+            extra_data["create_time"] = int(time.time() * 1000)
+            item = (number, event_id, prompt, extra_data, targets, sensitive)
+            try:
+                self.async_executor.enqueue(item, base_revision)
+            except ValueError as exc:
+                return graph_error(exc, 409)
+            self.number += 1
+            return web.json_response({"prompt_id": event_id, "event_id": event_id, "graph_id": key[1], "revision": revision, "number": number, "node_errors": {}})
 
         @routes.post("/queue")
         async def post_queue(request):
@@ -1307,30 +1292,7 @@ class PromptServer():
 
             # Check if a specific prompt_id was provided for targeted interruption
             prompt_id = json_data.get('prompt_id')
-            if hasattr(self, "async_executor"):
-                await asyncio.to_thread(self.async_executor.interrupt, prompt_id)
-                return web.Response(status=200)
-            if prompt_id:
-                currently_running, _ = self.prompt_queue.get_current_queue()
-
-                # Check if the prompt_id matches any currently running prompt
-                should_interrupt = False
-                for item in currently_running:
-                    # item structure: (number, prompt_id, prompt, extra_data, outputs_to_execute)
-                    if item[1] == prompt_id:
-                        logging.info(f"Interrupting prompt {prompt_id}")
-                        should_interrupt = True
-                        break
-
-                if should_interrupt:
-                    nodes.interrupt_processing()
-                else:
-                    logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
-            else:
-                # No prompt_id provided, do a global interrupt
-                logging.info("Global interrupt (no prompt_id specified)")
-                nodes.interrupt_processing()
-
+            await asyncio.to_thread(self.async_executor.interrupt, prompt_id)
             return web.Response(status=200)
 
         @routes.post("/free")
@@ -1620,19 +1582,6 @@ class PromptServer():
 
         if call_on_start is not None:
             call_on_start(scheme, self.address, self.port)
-
-    def add_on_prompt_handler(self, handler):
-        self.on_prompt_handlers.append(handler)
-
-    def trigger_on_prompt(self, json_data):
-        for handler in self.on_prompt_handlers:
-            try:
-                json_data = handler(json_data)
-            except Exception:
-                logging.warning("[ERROR] An error occurred during the on_prompt_handler processing")
-                logging.warning(traceback.format_exc())
-
-        return json_data
 
     def send_progress_text(
         self, text: Union[bytes, bytearray, str], node_id: str, sid=None

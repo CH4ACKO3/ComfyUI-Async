@@ -5,7 +5,6 @@ import atexit
 import concurrent.futures
 import copy
 import contextvars
-import heapq
 import json
 import logging
 import os
@@ -17,9 +16,10 @@ import tempfile
 import threading
 import time
 import weakref
-from collections import OrderedDict
 from dataclasses import dataclass
 from multiprocessing.connection import Client, Listener
+
+from comfy_execution.graph_utils import is_link
 
 import psutil
 
@@ -44,6 +44,16 @@ class WorkerError(RuntimeError):
     pass
 
 
+class StaleObjectError(WorkerError):
+    def __init__(self, device):
+        self.device = device
+        super().__init__(f"GPU worker {device} restarted; refresh the affected nodes")
+
+
+class GraphRevisionError(ValueError):
+    pass
+
+
 def map_values(value, visit):
     if type(value) is dict:
         return {k: map_values(v, visit) for k, v in value.items()}
@@ -54,9 +64,8 @@ def map_values(value, visit):
     return visit(value)
 
 
-def session_key(extra_data):
-    session = extra_data.get("execution_session")
-    return (extra_data.get("client_id", ""), session["id"]) if session else None
+def graph_key(extra_data):
+    return extra_data.get("client_id", ""), extra_data["graph_event"]["graph_id"]
 
 
 class Worker:
@@ -113,9 +122,6 @@ class Worker:
                 raise WorkerError(payload)
             else:
                 return payload
-
-    def request(self, command, payload=None):
-        return self.submit(command, payload).result()
 
     def submit(self, command, payload):
         with self.mutex:
@@ -227,7 +233,9 @@ class BrokerChannel:
                 with self.mutex:
                     future = self.pending.pop(request_id, None)
                 if future is not None and future.set_running_or_notify_cancel():
-                    if kind == "error":
+                    if kind == "stale":
+                        future.set_exception(StaleObjectError(value))
+                    elif kind == "error":
                         future.set_exception(WorkerError(value))
                     else:
                         future.set_result(value)
@@ -236,8 +244,11 @@ class BrokerChannel:
 
 
 class Runtime:
-    def __init__(self, config, server, channel):
+    def __init__(self, config, server, channel, graph, interrupted):
         self.channel = channel
+        self.graph = graph
+        self.interrupted = interrupted
+        self.node_keys = {}
         self.config = config
         self.server = server
         self.owner = config["owner"]
@@ -256,7 +267,7 @@ class Runtime:
         root_id = self.dynprompt.get_real_node_id(node_id)
         payload = {
             "owner": self.owner,
-            "session_id": session_key(self.extra_data),
+            "graph_key": graph_key(self.extra_data),
             "prompt_id": self.prompt_id,
             "node_id": node_id,
             "index": index,
@@ -273,8 +284,11 @@ class Runtime:
         self.tasks.add(task)
         try:
             try:
-                result = await asyncio.wrap_future(self.channel.submit("call", payload))
-            except WorkerError:
+                result = await self.graph.call(self, node_id, index, func, payload)
+            except StaleObjectError as exc:
+                self.graph.invalidate_device(exc.device)
+                raise
+            except (WorkerError, asyncio.CancelledError):
                 if self.prompt_id and os.path.exists(os.path.join(self.config["lock_directory"], self.prompt_id + ".cancel")):
                     from comfy.model_management import InterruptProcessingException
                     raise InterruptProcessingException()
@@ -294,7 +308,7 @@ class ResidentGraphExecutor:
         self.worker = None
         self.cancelled = set()
         self.clear_requested = False
-        self.revisions = OrderedDict()
+        self.revisions = {}
         self.frames = {}
         from comfy_execution.async_scheduler import DeviceScheduler
         self.scheduler = DeviceScheduler(self.directory.name, default_device, server.send_sync)
@@ -331,80 +345,74 @@ class ResidentGraphExecutor:
     def start(self):
         threading.Thread(target=self.dispatch, name="graph-inputs", daemon=True).start()
 
-    def enqueue(self, item, base_revision=None):
-        # Queue ownership makes revision checks and replacement atomic with dequeue.
-        import execution
-
-        session = item[3].get("execution_session")
-        if session is None:
-            self.queue.put(item)
-            return
-        if (not isinstance(session, dict) or not isinstance(session.get("id"), str)
-                or not 1 <= len(session["id"]) <= 128 or type(session.get("revision")) is not int
-                or session["revision"] < 0 or session.get("policy", "latest") not in ("latest", "fifo")):
-            raise ValueError("execution_session requires id, nonnegative integer revision and latest/fifo policy")
-        session = item[3]["execution_session"] = {"id": session["id"], "revision": session["revision"], "policy": session.get("policy", "latest")}
-        key = session_key(item[3])
+    def register_graph(self, key, prompt):
         with self.queue.mutex:
-            if base_revision is not None and base_revision != self.revisions.get(key):
-                raise ValueError("Graph changed while validating this refresh; resubmit it")
-            if session["revision"] <= self.revisions.get(key, -1):
-                raise ValueError("execution_session revision must increase")
-            pending = [queued for queued in self.queue.queue if session_key(queued[3]) == key]
-            if session["policy"] == "fifo" and len(pending) >= 64:
-                raise OverflowError("Execution session has 64 pending inputs; wait before submitting more")
-            if key not in self.revisions and len(self.revisions) >= 256:
-                active = {session_key(queued[3]) for queued in self.queue.queue + list(self.queue.currently_running.values())}
-                oldest = next((candidate for candidate in self.revisions if candidate not in active), None)
-                if oldest is None:
-                    raise OverflowError("Too many active execution sessions")
-                del self.revisions[oldest]
-                del self.frames[oldest]
-            self.frames[key] = copy.deepcopy(item[2])
-            self.revisions[key] = session["revision"]
-            self.revisions.move_to_end(key)
-            if session["policy"] == "latest":
-                for queued in pending:
-                    self.queue.queue.remove(queued)
-                heapq.heapify(self.queue.queue)
-            self.queue.put(item)
-            if session["policy"] == "latest":
-                for queued in pending:
-                    details = {"prompt_id": queued[1], "execution_session": queued[3]["execution_session"], "replacement_prompt_id": item[1], "timestamp": int(time.time() * 1000)}
-                    item_id = self.queue.task_counter
-                    self.queue.task_counter += 1
-                    self.queue.currently_running[item_id] = queued
-                    self.queue.task_done(item_id, {}, execution.PromptQueue.ExecutionStatus("error", False, [("execution_superseded", details)]), process_item=lambda prompt: prompt[:5])
-                    self.server.send_sync("execution_superseded", details, item[3].get("client_id"))
+            if key in self.frames:
+                raise ValueError("Graph already registered")
+            self.frames[key] = copy.deepcopy(prompt)
+            for node in self.frames[key].values():
+                node.setdefault("_meta", {})["input_revision"] = 0
+            self.revisions[key] = 0
 
-    def expand_refresh(self, data):
-        extra_data = dict(data.get("extra_data", {}), client_id=data.get("client_id", ""))
-        session = extra_data.get("execution_session")
-        if not isinstance(session, dict) or not isinstance(session.get("id"), str) or type(session.get("revision")) is not int:
-            raise ValueError("A refresh requires execution_session id and integer revision")
-        changes = data["refresh"]
-        if not isinstance(changes, dict) or not changes:
-            raise ValueError("refresh must map node IDs to updated inputs")
-        key = session_key(extra_data)
+    def prepare_event(self, key, base_revision, changes, refresh):
+        if type(base_revision) is not int or base_revision < 0:
+            raise ValueError("base_revision must be a nonnegative integer")
+        if not isinstance(changes, dict) or not isinstance(refresh, list) or any(not isinstance(node_id, str) for node_id in refresh):
+            raise ValueError("changes must map node IDs to definitions; refresh must list node IDs")
+        if not changes and not refresh:
+            raise ValueError("An event requires changed or refreshed nodes")
         with self.queue.mutex:
             if key not in self.frames:
-                raise ValueError("Submit the full graph with this execution_session before refreshing nodes")
+                raise KeyError("Register the graph before sending events")
+            if base_revision != self.revisions[key]:
+                raise GraphRevisionError("Graph revision changed; reload its state before submitting this event")
             prompt = copy.deepcopy(self.frames[key])
-            base_revision = self.revisions[key]
-        for node_id, inputs in changes.items():
-            if node_id not in prompt or not isinstance(inputs, dict):
-                raise ValueError("Each refresh entry must identify an existing node and an input mapping")
-            prompt[node_id]["inputs"].update(inputs)
-            prompt[node_id].setdefault("_meta", {})["input_revision"] = session["revision"]
-        return prompt, base_revision
+        revision = base_revision + 1
+        changed = set(changes) | set(refresh)
+        for node_id, node in changes.items():
+            if node is None:
+                if node_id not in prompt:
+                    raise ValueError(f"Unknown node {node_id}")
+                del prompt[node_id]
+            else:
+                prompt[node_id] = copy.deepcopy(node)
+        for node_id in refresh:
+            if node_id not in prompt:
+                raise ValueError(f"Unknown node {node_id}")
+        for node_id in changed & prompt.keys():
+            prompt[node_id].setdefault("_meta", {})["input_revision"] = revision
+        children = {node_id: set() for node_id in changed | prompt.keys()}
+        for node_id, node in prompt.items():
+            for value in node["inputs"].values():
+                if is_link(value):
+                    children.setdefault(value[0], set()).add(node_id)
+        affected = set(changed)
+        pending = list(changed)
+        while pending:
+            for node_id in children[pending.pop()] - affected:
+                affected.add(node_id)
+                pending.append(node_id)
+        affected.intersection_update(prompt)
+        targets = [node_id for node_id in prompt if node_id in affected and not children[node_id]]
+        return prompt, revision, sorted(changed), affected, targets
+
+    def enqueue(self, item, base_revision):
+        key = graph_key(item[3])
+        with self.queue.mutex:
+            if base_revision != self.revisions.get(key):
+                raise GraphRevisionError("Graph changed while validating this event; resubmit it")
+            if item[1] in self.queue.history or any(queued[1] == item[1] for queued in self.queue.queue + list(self.queue.currently_running.values())):
+                raise ValueError("event_id has already been submitted")
+            self.frames[key] = copy.deepcopy(item[2])
+            self.revisions[key] = item[3]["graph_event"]["revision"]
+            self.queue.put(item)
 
     def forward(self, item, event, data, sid=None):
         from comfy_execution.asset_enrichment import register_executed_outputs
         from protocol import BinaryEventTypes
 
         metadata = item[3].get("workflow_metadata", {})
-        if "execution_session" in item[3]:
-            metadata = {**metadata, "execution_session": item[3]["execution_session"]}
+        metadata = {**metadata, "graph_event": item[3]["graph_event"]}
         if isinstance(data, dict) and "prompt_id" in data:
             data = {**metadata, **data}
             if event == "executed":
@@ -429,13 +437,13 @@ class ResidentGraphExecutor:
                     if self.worker is not None:
                         self.worker.close()
                         self.scheduler.clear()
-                    self.worker = Worker({"role": "prompt", "lock_directory": self.directory.name, **self.scheduler.config}, self.scheduler.forward)
+                    self.worker = Worker({"role": "graph", "lock_directory": self.directory.name, **self.scheduler.config}, self.scheduler.forward)
                 worker = self.worker
                 self.running[item[1]] = worker
                 self.scheduler.routes[item[1]] = lambda event, data, sid=None, item=item: self.forward(item, event, data, sid)
             self.asset_manager.pause_background_scan()
             try:
-                future = worker.submit("prompt", {"item": item, "sockets_metadata": self.server.sockets_metadata})
+                future = worker.submit("event", {"item": item, "sockets_metadata": self.server.sockets_metadata})
             except Exception as exc:
                 future = concurrent.futures.Future()
                 future.set_exception(exc)

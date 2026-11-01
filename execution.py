@@ -774,6 +774,8 @@ class PromptExecutor:
                 for cache in self.caches.all:
                     await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
                     cache.clean_unused()
+                if runtime is not None:
+                    runtime.node_keys = self.caches.outputs.cache_key_set.keys
 
                 node_ids = list(prompt.keys())
                 cache_results = await asyncio.gather(
@@ -1194,9 +1196,8 @@ async def validate_prompt(prompt_id, prompt, partial_execution_list: Union[list[
             }
             return (False, error, [], {})
 
-        if hasattr(class_, 'OUTPUT_NODE') and class_.OUTPUT_NODE is True:
-            if partial_execution_list is None or x in partial_execution_list:
-                outputs.add(x)
+        if x in partial_execution_list if partial_execution_list is not None else getattr(class_, "OUTPUT_NODE", False):
+            outputs.add(x)
 
     if len(outputs) == 0:
         error = {

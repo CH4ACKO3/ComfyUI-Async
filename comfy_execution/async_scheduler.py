@@ -10,7 +10,7 @@ import threading
 import time
 from multiprocessing.connection import Listener
 
-from comfy_execution.async_execution import ObjectRef, Worker, WorkerError, map_values
+from comfy_execution.async_execution import ObjectRef, StaleObjectError, Worker, WorkerError, map_values
 
 
 class DeviceQueue:
@@ -76,7 +76,9 @@ class DeviceQueue:
         except Exception as exc:
             if not self.closed and self.worker.process is not None and (self.worker.closed or self.worker.connection is None or self.worker.process.poll() is not None):
                 self.close()
-            future.set_exception(exc)
+                future.set_exception(StaleObjectError(self.worker.config["worker_id"]))
+            else:
+                future.set_exception(exc)
         finally:
             with self.scheduler.mutex:
                 elapsed = time.monotonic() - start
@@ -97,6 +99,7 @@ class DeviceScheduler:
         self.send_event = send_event
         self.workers = {}
         self.routes = {}
+        self.subscribers = {}
         self.mutex = threading.RLock()
         self.authkey = secrets.token_bytes(32)
         self.listener = Listener(("127.0.0.1", 0), backlog=socket.SOMAXCONN, authkey=self.authkey)
@@ -114,11 +117,19 @@ class DeviceScheduler:
         else:
             prompt_id = None
         with self.mutex:
-            route = self.routes.get(prompt_id)
-        if route is not None:
-            route(event, data, sid)
-        elif prompt_id is None:
-            self.send_event(event, data, sid)
+            subscribers = self.subscribers.get(prompt_id)
+            routes = [(event_id, self.routes.get(event_id)) for event_id in subscribers] if subscribers is not None else [(prompt_id, self.routes.get(prompt_id))]
+        for event_id, route in routes:
+            if route is not None:
+                if isinstance(data, dict):
+                    routed = dict(data, prompt_id=event_id)
+                elif isinstance(data, tuple) and len(data) == 2 and isinstance(data[1], dict):
+                    routed = (data[0], dict(data[1], prompt_id=event_id))
+                else:
+                    routed = data
+                route(event, routed, sid)
+            elif prompt_id is None:
+                self.send_event(event, data, sid)
 
     def accept(self):
         while True:
@@ -134,6 +145,8 @@ class DeviceScheduler:
         def respond(request_id, command, payload):
             try:
                 result = (request_id, "result", self.request(command, payload))
+            except StaleObjectError as exc:
+                result = (request_id, "stale", exc.device)
             except Exception as exc:
                 result = (request_id, "error", str(exc))
             try:
@@ -146,7 +159,10 @@ class DeviceScheduler:
             try:
                 while True:
                     request_id, command, payload = connection.recv()
-                    threading.Thread(target=respond, args=(request_id, command, payload), daemon=True).start()
+                    if command in ("subscribe", "unsubscribe", "cancel"):
+                        respond(request_id, command, payload)
+                    else:
+                        threading.Thread(target=respond, args=(request_id, command, payload), daemon=True).start()
             except (OSError, EOFError):
                 pass
 
@@ -158,17 +174,27 @@ class DeviceScheduler:
 
     def request(self, command, payload):
         with self.mutex:
+            if command == "subscribe":
+                self.subscribers.setdefault(payload["call_id"], set()).add(payload["prompt_id"])
+                return None
+            if command == "unsubscribe":
+                subscribers = self.subscribers.get(payload["call_id"], set())
+                subscribers.discard(payload["prompt_id"])
+                if not subscribers:
+                    self.subscribers.pop(payload["call_id"], None)
+                return None
             if command == "cancel":
                 with open(os.path.join(self.directory, payload["prompt_id"] + ".cancel"), "w"):
                     pass
                 return None
-            if command in ("trim", "release"):
-                futures = [worker.submit(command, payload) for worker in self.workers.values() if not worker.closed and payload["owner"] in worker.owners]
+            if command in ("trim", "release", "retire"):
+                devices = {ref.worker for ref in payload["objects"]} if command == "retire" else self.workers.keys()
+                futures = [worker.submit(command, payload) for device, worker in self.workers.items() if device in devices and not worker.closed and payload["owner"] in worker.owners]
             elif command == "export":
                 ref = payload["ref"]
                 worker = self.workers[ref.worker]
                 if worker.closed or worker.generation != ref.generation:
-                    raise WorkerError("A GPU worker restarted; resubmit this workflow")
+                    raise StaleObjectError(ref.worker)
                 futures = [worker.submit(command, payload)]
             else:
                 if self.cancelled(payload["prompt_id"]):
@@ -179,7 +205,7 @@ class DeviceScheduler:
                     if isinstance(value, ObjectRef):
                         worker = self.workers.get(value.worker)
                         if worker is None or worker.closed or worker.generation != value.generation:
-                            raise WorkerError("A GPU worker restarted; resubmit this workflow")
+                            raise StaleObjectError(value.worker)
                         if not value.transferable:
                             owners.add(value.worker)
                     return value
@@ -234,7 +260,7 @@ class DeviceScheduler:
             except WorkerError:
                 if command != "release":
                     raise
-        return results[0] if command not in ("trim", "release") else None
+        return results[0] if command not in ("trim", "release", "retire") else None
 
     def snapshot(self):
         with self.mutex:

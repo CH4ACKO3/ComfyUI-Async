@@ -256,8 +256,6 @@ execute_prestartup_script()
 
 # Main code
 import asyncio
-import threading
-import gc
 
 if 'torch' in sys.modules:
     logging.warning("WARNING: Potential Error in code: Torch already imported, torch should never be imported before this point.")
@@ -265,7 +263,6 @@ if 'torch' in sys.modules:
 
 import comfy.utils
 
-import execution
 from comfy_execution.async_execution import ResidentGraphExecutor
 import server
 from app.assets.manager import AssetManager, default_asset_manager  # imports torch, so not before the check above
@@ -333,121 +330,6 @@ def cuda_malloc_warning():
                 cuda_malloc_warning = True
         if cuda_malloc_warning:
             logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
-
-
-def prompt_worker(q, server_instance, asset_manager):
-    current_time: float = 0.0
-    cache_ram = 0
-    cache_ram_inactive = 0
-    if not args.cache_classic and not args.cache_none and args.cache_lru <= 0:
-        cache_ram = min(10.0, max(2.0, comfy.model_management.total_ram * 0.10 / 1024.0))
-        cache_ram_inactive = min(128.0, comfy.model_management.total_ram / 1024.0)
-        if len(args.cache_ram) > 0:
-            cache_ram = args.cache_ram[0]
-        if len(args.cache_ram) > 1:
-            cache_ram_inactive = args.cache_ram[1]
-
-    cache_type = execution.CacheType.RAM_PRESSURE
-    if args.cache_classic:
-        cache_type = execution.CacheType.CLASSIC
-    elif args.cache_lru > 0:
-        cache_type = execution.CacheType.LRU
-    elif args.cache_none:
-        cache_type = execution.CacheType.NONE
-
-    e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager )
-    last_gc_collect = 0
-    need_gc = False
-    gc_collect_interval = 10.0
-    background_scan_paused = False
-
-    while True:
-        try:
-            timeout = 1000.0
-            if need_gc:
-                timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
-
-            queue_item = q.get(timeout=timeout)
-            if queue_item is not None:
-                item, item_id = queue_item
-                execution_start_time = time.perf_counter()
-                prompt_id = item[1]
-                server_instance.last_prompt_id = prompt_id
-                server_instance.workflow_metadata = item[3].get("workflow_metadata", {})
-
-                sensitive = item[5]
-                extra_data = item[3].copy()
-                for k in sensitive:
-                    extra_data[k] = sensitive[k]
-
-                asset_manager.pause_background_scan()
-                background_scan_paused = True
-                e.execute(item[2], prompt_id, extra_data, item[4])
-
-                need_gc = True
-
-                remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
-                q.task_done(item_id,
-                            e.history_result,
-                            status=execution.PromptQueue.ExecutionStatus(
-                                status_str='success' if e.success else 'error',
-                                completed=e.success,
-                                messages=e.status_messages), process_item=remove_sensitive)
-                if q.get_tasks_remaining() == 0:
-                    # Nothing else is queued, so let the background scan run now rather than on the next GC tick.
-                    asset_manager.resume_background_scan()
-                if server_instance.client_id is not None:
-                    server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
-                server_instance.workflow_metadata = {}
-
-                current_time = time.perf_counter()
-                execution_time = current_time - execution_start_time
-
-                # Log Time in a more readable way after 10 minutes
-                if execution_time > 600:
-                    execution_time = time.strftime("%H:%M:%S", time.gmtime(execution_time))
-                    logging.info(f"Prompt executed in {execution_time}", extra={'color': 'green'})
-                else:
-                    logging.info("Prompt executed in {:.2f} seconds".format(execution_time), extra={'color': 'green'})
-
-                job_hint = product_tips.get_relevant_job_hint(args, os.environ, e.success, extra_data)
-                if job_hint is not None:
-                    logging.info(job_hint)
-
-            flags = q.get_flags()
-            free_memory = flags.get("free_memory", False)
-
-            if flags.get("unload_models", free_memory):
-                comfy.model_management.unload_all_models()
-                need_gc = True
-                last_gc_collect = 0
-
-            if free_memory:
-                e.reset()
-                need_gc = True
-                last_gc_collect = 0
-
-            if need_gc:
-                current_time = time.perf_counter()
-                if (current_time - last_gc_collect) > gc_collect_interval:
-                    gc.collect()
-                    comfy.model_management.soft_empty_cache()
-                    last_gc_collect = current_time
-                    need_gc = False
-                    hook_breaker_ac10a0.restore_functions()
-
-                    asset_manager.queue_output_scan()
-                    asset_manager.resume_background_scan()
-                    background_scan_paused = False
-        # BaseException is deliberate. This runs on the worker thread, so Ctrl-C lands in
-        # the main thread instead, and resume only flips the seeder's pause state.
-        except BaseException:
-            if background_scan_paused:
-                try:
-                    asset_manager.resume_background_scan()
-                except Exception:
-                    logging.exception("Failed to resume background asset scanning after prompt worker failure")
-            raise
 
 
 async def run(server_instance, address='', port=8188, verbose=True, call_on_start=None):
@@ -628,11 +510,8 @@ def start_comfyui(asyncio_loop=None):
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    if not args.disable_async_execution:
-        prompt_server.async_executor = ResidentGraphExecutor(prompt_server, prompt_server.prompt_queue, asset_manager, str(comfy.model_management.get_torch_device()))
-        prompt_server.async_executor.start()
-    else:
-        threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server, asset_manager)).start()
+    prompt_server.async_executor = ResidentGraphExecutor(prompt_server, prompt_server.prompt_queue, asset_manager, str(comfy.model_management.get_torch_device()))
+    prompt_server.async_executor.start()
 
     if args.quick_test_for_ci:
         exit(0)
