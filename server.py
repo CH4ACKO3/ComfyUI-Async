@@ -1218,7 +1218,7 @@ class PromptServer():
                     available_devices = {str(device) for device in comfy.model_management.get_all_torch_devices() if device.type == "cuda"}
                     for node_id, node in prompt.items():
                         devices = node.get("_meta", {}).get("gpu_devices", [])
-                        if not isinstance(devices, list) or ("gpu_devices" in node.get("_meta", {}) and not devices) or any(not isinstance(device, str) or device not in available_devices for device in devices):
+                        if not isinstance(devices, list) or any(not isinstance(device, str) or device not in available_devices for device in devices):
                             return web.json_response({"error": {"type": "invalid_gpu_devices", "message": f"Node {node_id} has unavailable GPU assignments", "details": str(devices), "extra_info": {}}, "node_errors": {}}, status=400)
 
                 valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)

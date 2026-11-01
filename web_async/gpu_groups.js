@@ -75,7 +75,7 @@ app.registerExtension({
         LiteGraph.LGraphGroup.prototype.draw = function (canvas, ctx) {
             draw.call(this, canvas, ctx);
             const selected = selectedDevices(this);
-            const label = selected.length ? `cuda ${selected.map((id) => id.split(":")[1]).join(",")}` : "no GPUs";
+            const label = selected.length ? `cuda ${selected.map((id) => id.split(":")[1]).join(",")}` : "Native";
             ctx.save();
             ctx.beginPath();
             ctx.rect(this.pos[0], this.pos[1], this.size[0], this.titleHeight);
@@ -100,11 +100,10 @@ app.registerExtension({
                 const centerY = node.pos[1] + node.size[1] / 2;
                 const group = groups.find(({ bounding: [x, y, width, height] }) =>
                     centerX >= x && centerX <= x + width && centerY >= y && centerY <= y + height);
+                const selected = group ? selectedDevices(group) : [];
                 for (const [id, output] of Object.entries(result.output)) {
                     if (id !== String(node.id) && !id.startsWith(`${node.id}:`)) continue;
-                    if (group) {
-                        const selected = selectedDevices(group);
-                        if (!selected.length) throw new Error(`Group "${group.title}" has no GPUs enabled. Select at least one in Execution GPUs.`);
+                    if (selected.length) {
                         output._meta = { ...output._meta, gpu_devices: [...selected] };
                     } else if (output._meta) delete output._meta.gpu_devices;
                 }
