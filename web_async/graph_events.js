@@ -28,11 +28,25 @@ function differences(previous, current) {
     return changes;
 }
 
+function workflowNodes(workflow) {
+    const nodes = new Map();
+    function visit(items, prefix = "") {
+        for (const node of items) {
+            const id = prefix + node.id;
+            nodes.set(id, node);
+            const subgraph = workflow.definitions?.subgraphs?.find((graph) => graph.id === node.type);
+            if (subgraph) visit(subgraph.nodes, `${id}:`);
+        }
+    }
+    visit(workflow.nodes);
+    return nodes;
+}
+
 function graphState(snapshot) {
     const key = `${api.clientId ?? ""}:${snapshot.workflow.id}`;
     let state = graphs.get(key);
     if (!state) {
-        state = { id: LiteGraph.uuidv4(), revision: 0, sent: null, observed: snapshot.output, pending: Promise.resolve() };
+        state = { id: LiteGraph.uuidv4(), revision: 0, sent: null, observed: snapshot, pending: Promise.resolve() };
         graphs.set(key, state);
     }
     return state;
@@ -86,12 +100,30 @@ async function observe(baseline = false) {
     if (configuring) return;
     const snapshot = structuredClone(await app.graphToPrompt());
     const state = graphState(snapshot);
-    const changes = differences(state.observed, snapshot.output);
-    state.observed = snapshot.output;
-    if (baseline || !Object.keys(changes).length) return;
-    const refresh = pendingEdit?.state === state ? pendingEdit.refresh : new Set();
-    for (const id of Object.keys(changes)) refresh.add(id);
-    pendingEdit = { state, snapshot, refresh };
+    const changes = differences(state.observed.output, snapshot.output);
+    const previousNodes = workflowNodes(state.observed.workflow);
+    const nodes = workflowNodes(snapshot.workflow);
+    state.observed = snapshot;
+    if (baseline) return;
+    const changed = Object.keys(changes);
+    const triggers = [...nodes].filter(([id, node]) => node.mode === LiteGraph.ON_EVENT && previousNodes.get(id)?.mode === LiteGraph.ON_EVENT && (
+        changed.some((changedId) => snapshot.output[changedId] && (changedId === id || changedId.startsWith(`${id}:`))) ||
+        (!snapshot.output[id] && changed.length && JSON.stringify(node.widgets_values) !== JSON.stringify(previousNodes.get(id)?.widgets_values))
+    )).map(([id]) => id);
+    const edit = pendingEdit?.state === state ? pendingEdit : { state, refresh: new Set(), triggers: new Set() };
+    edit.snapshot = snapshot;
+    for (const id of edit.triggers) if (nodes.get(id)?.mode !== LiteGraph.ON_EVENT) edit.triggers.delete(id);
+    for (const id of triggers) edit.triggers.add(id);
+    if (!edit.triggers.size) {
+        if (pendingEdit?.state === state) {
+            clearTimeout(timer);
+            pendingEdit = null;
+        }
+        return;
+    }
+    if (!triggers.length) return;
+    for (const id of changed) edit.refresh.add(id);
+    pendingEdit = edit;
     clearTimeout(timer);
     timer = setTimeout(async () => {
         const edit = pendingEdit;
@@ -120,7 +152,7 @@ app.registerExtension({
             clearTimeout(timer);
             pendingEdit = null;
             const snapshot = structuredClone(data);
-            graphState(snapshot).observed = snapshot.output;
+            graphState(snapshot).observed = snapshot;
             const selected = options.partialExecutionTargets;
             const refresh = selected?.length ? selected.map(String) : Object.keys(snapshot.output).filter((id) =>
                 !Object.values(snapshot.output[id].inputs).some((value) => Array.isArray(value) && value.length === 2 && typeof value[0] === "string" && Number.isInteger(value[1])));
@@ -129,7 +161,7 @@ app.registerExtension({
             return await submit(snapshot, refresh, options, number);
         };
 
-        // Graph edits already submit events, including when the old auto-queue mode is selected.
+        // Node modes own automatic submission, including when the old auto-queue mode is selected.
         const dispatch = api.dispatchCustomEvent;
         api.dispatchCustomEvent = function (type, ...args) {
             if (type === "autoQueueGraphChanged") return;

@@ -16,7 +16,7 @@ Current node versions and versions needed by active events stay resident. A per-
 
 ## Node events
 
-Run refreshes source nodes (nodes without incoming links); Run Selected refreshes the selected nodes. Widget/input edits automatically submit changes, grouped within 150 ms; loading a workflow and layout-only edits do not execute nodes. Native seed-widget callbacks still apply. Both Run and edits use the same event API; neither posts a full workflow for execution.
+Run refreshes source nodes (nodes without incoming links); Run Selected refreshes the selected nodes. Edits do not submit events by default. Set a node’s native **Mode → On Event** to submit its input changes automatically, grouped within 150 ms. The mode is saved with the workflow; loading a workflow, enabling On Event and layout-only edits do not execute nodes. Pending edits to other nodes are included in the next manual or automatic submission. Native seed-widget callbacks still apply. Both Run and edits use the same event API; neither posts a full workflow for execution.
 
 Register a graph without running it using `PUT /graphs/{graph_id}` with `{"client_id": "canvas", "nodes": {...}}`. Graph IDs and event IDs are UUIDs. Submit an atomic change with `POST /graphs/{graph_id}/events`:
 
