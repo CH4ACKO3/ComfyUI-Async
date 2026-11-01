@@ -67,6 +67,7 @@ class Worker:
         self.lifecycle = threading.Lock()
         self.closed = False
         self.pending = {}
+        self.pending_mutex = threading.Lock()
         self.request_index = 0
 
     def start(self):
@@ -135,11 +136,13 @@ class Worker:
             self.request_index += 1
             request_id = self.request_index
             future = concurrent.futures.Future()
-            self.pending[request_id] = future
+            with self.pending_mutex:
+                self.pending[request_id] = future
             try:
                 self.connection.send((request_id, command, payload))
             except (BrokenPipeError, OSError) as exc:
-                self.pending.pop(request_id)
+                with self.pending_mutex:
+                    self.pending.pop(request_id, None)
                 raise WorkerError("Execution worker stopped") from exc
             return future
 
@@ -151,14 +154,14 @@ class Worker:
                     self.send_event(*payload)
                     continue
                 request_id, response = payload
-                with self.mutex:
+                with self.pending_mutex:
                     future = self.pending.pop(request_id)
                 if kind == "error":
                     future.set_exception(WorkerError(response))
                 else:
                     future.set_result(response)
         except (EOFError, OSError):
-            with self.mutex:
+            with self.pending_mutex:
                 pending, self.pending = self.pending, {}
             for future in pending.values():
                 future.set_exception(WorkerError("Execution worker stopped; see the server log"))

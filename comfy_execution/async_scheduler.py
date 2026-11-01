@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import secrets
+import socket
 import threading
 import time
 from multiprocessing.connection import Listener
@@ -98,7 +99,7 @@ class DeviceScheduler:
         self.routes = {}
         self.mutex = threading.RLock()
         self.authkey = secrets.token_bytes(32)
-        self.listener = Listener(("127.0.0.1", 0), authkey=self.authkey)
+        self.listener = Listener(("127.0.0.1", 0), backlog=socket.SOMAXCONN, authkey=self.authkey)
         self.config = {"broker_address": self.listener.address, "broker_authkey": self.authkey.hex()}
         threading.Thread(target=self.accept, name="gpu-scheduler", daemon=True).start()
 

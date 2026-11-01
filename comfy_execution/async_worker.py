@@ -1,7 +1,6 @@
 """Private, authenticated local worker. Started by async_execution.Worker."""
 
 import asyncio
-import concurrent.futures
 import contextvars
 import inspect
 import json
@@ -115,7 +114,7 @@ def run():
     if config["role"] == "node":
         worker_server = CallServer(worker_server)
         server.PromptServer.instance = worker_server
-        if args.async_node_concurrency > 1:
+        if args.async_node_concurrency != 1:
             args.disable_comfy_compiler = True
     main.hijack_progress(worker_server)
     comfy.model_management.set_cudnn_benchmark()
@@ -313,9 +312,10 @@ def run():
             return {"model_loads": model_loads, "model_hits": model_hits,
                     "model_keys": [key[0] for key in model_cache], "objects": len(objects), "owners": len(leases),
                     "active_calls": admission.active, "peak_concurrent_calls": admission.peak,
+                    "concurrency_limit": admission.limit,
                     "resident_preparations": admission.preparations}
 
-    def execute_call(request_id, payload):
+    def execute_call(request_id, payload, admitted):
         payload = dict(payload, call_id=request_id)
         token = call_payload.set(payload)
         interrupted = threading.Event()
@@ -339,6 +339,7 @@ def run():
             for attempt in range(attempts):
                 try:
                     with admission.execution(class_def, payload["func"], inputs, serial=attempt > 0) as call_inputs:
+                        admitted.set()
                         if obj is None:
                             with state_lock:
                                 pool = instances.setdefault(key, [])
@@ -369,6 +370,7 @@ def run():
         except (Exception, comfy.model_management.InterruptProcessingException):
             send(("error", (request_id, traceback.format_exc())))
         finally:
+            admitted.set()
             if obj is not None:
                 with state_lock:
                     instances[key].append(obj)
@@ -377,35 +379,39 @@ def run():
             comfy.model_management.processing_interrupt_event.reset(interrupt_token)
             call_payload.reset(token)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.async_node_concurrency) as executor:
-        pending = set()
-        while True:
-            request_id, command, payload = connection.recv()
-            if command == "call":
-                pending = {future for future in pending if not future.done()}
-                pending.add(executor.submit(execute_call, request_id, payload))
-                continue
-            # Objects are exported or retired only after earlier calls finish.
-            for future in pending:
-                future.result()
-            pending.clear()
-            try:
-                owner = payload.get("owner")
-                if command == "export":
-                    result = ObjectData(pickle.dumps(objects[payload["ref"].key].detach().cpu(), protocol=pickle.HIGHEST_PROTOCOL))
+    pending = []
+    while True:
+        request_id, command, payload = connection.recv()
+        if command == "call":
+            pending = [thread for thread in pending if thread.is_alive()]
+            admitted = threading.Event()
+            thread = threading.Thread(target=execute_call, args=(request_id, payload, admitted))
+            pending.append(thread)
+            thread.start()
+            # Keep only one new call waiting for memory or an exclusive node.
+            admitted.wait()
+            continue
+        # Objects are exported or retired only after earlier calls finish.
+        for thread in pending:
+            thread.join()
+        pending.clear()
+        try:
+            owner = payload.get("owner")
+            if command == "export":
+                result = ObjectData(pickle.dumps(objects[payload["ref"].key].detach().cpu(), protocol=pickle.HIGHEST_PROTOCOL))
+            else:
+                if command == "release":
+                    leases.pop(owner, None)
                 else:
-                    if command == "release":
-                        leases.pop(owner, None)
-                    else:
-                        leases[owner] = {ref.key for ref in payload["objects"] if ref.worker == worker_id and ref.generation == generation}
-                    for key in list(instances):
-                        if key[0] == owner and (command == "release" or key[1] != payload["session_id"] or key[2:] not in payload["nodes"]):
-                            del instances[key]
-                    collect_unused()
-                    result = None
-                send(("result", (request_id, {"value": result, "stats": stats()})))
-            except Exception:
-                send(("error", (request_id, traceback.format_exc())))
+                    leases[owner] = {ref.key for ref in payload["objects"] if ref.worker == worker_id and ref.generation == generation}
+                for key in list(instances):
+                    if key[0] == owner and (command == "release" or key[1] != payload["session_id"] or key[2:] not in payload["nodes"]):
+                        del instances[key]
+                collect_unused()
+                result = None
+            send(("result", (request_id, {"value": result, "stats": stats()})))
+        except Exception:
+            send(("error", (request_id, traceback.format_exc())))
 
 
 if __name__ == "__main__":

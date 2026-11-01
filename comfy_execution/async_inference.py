@@ -51,7 +51,7 @@ class NodeAdmission:
         return max(required, 512 * 1024 * 1024)
 
     def prepare(self, model, memory):
-        if model.model_size() + memory * self.limit + mm.extra_reserved_memory() > mm.get_total_memory(model.load_device):
+        if model.model_size() + memory + mm.extra_reserved_memory() > mm.get_total_memory(model.load_device):
             return None
         key = (model.model, model.patches_uuid)
         if self.prepared is None or self.prepared[:2] != key:
@@ -59,7 +59,7 @@ class NodeAdmission:
             self.prepared = (*key, resident)
             self.preparations += 1
         resident = self.prepared[2]
-        mm.load_models_gpu([resident], memory_required=memory * self.limit, force_full_load=True)
+        mm.load_models_gpu([resident], memory_required=memory, force_full_load=True)
         torch.cuda.current_stream(model.load_device).synchronize()
         if resident.model.model_lowvram or resident.loaded_size() < resident.model_size():
             return None
@@ -67,33 +67,42 @@ class NodeAdmission:
 
     @contextmanager
     def execution(self, class_def, func, inputs, serial=False):
-        memory = None if serial or self.limit == 1 else self.sampler_memory(class_def, func, inputs)
-        parallel = not serial and self.limit > 1 and (
+        sampler_memory = None if serial or self.limit == 1 else self.sampler_memory(class_def, func, inputs)
+        safe_parallel = not serial and self.limit != 1 and (
             class_def in (nodes.EmptyImage, nodes.EmptyLatentImage, nodes.ImageScale, nodes.ImageScaleBy, nodes.ImageInvert)
             or getattr(class_def, 'ASYNC_CONCURRENT_SAFE', False))
+        device = mm.get_torch_device()
         resident = None
         with self.condition:
             while True:
                 mm.throw_exception_if_processing_interrupted()
-                if not self.exclusive and not self.draining and not self.writers:
-                    if memory is not None:
+                if (not self.exclusive and not self.draining and not self.writers
+                        and (self.limit is None or self.active < self.limit)):
+                    parallel = safe_parallel
+                    memory = 512 * 1024 * 1024 if parallel else 0
+                    resident = None
+                    if sampler_memory is not None:
                         model = inputs['model']
                         if self.prepared is not None and self.prepared[:2] == (model.model, model.patches_uuid):
                             candidate = self.prepared[2]
                             if candidate.loaded_size() >= candidate.model_size() and not candidate.model.model_lowvram:
                                 resident = candidate
                         if self.active == 0:
-                            resident = self.prepare(model, memory)
-                            if resident is None:
-                                memory = None
-                        if resident is not None and mm.get_free_memory(model.load_device) >= self.reserved + memory:
+                            resident = self.prepare(model, sampler_memory)
+                        if resident is not None:
                             parallel = True
-                        elif self.active == 0:
-                            memory = None
-                    if parallel or (self.active == 0 and memory is None):
+                            memory = sampler_memory
+                    if parallel:
+                        headroom = mm.extra_reserved_memory() if device.type != 'cpu' else 0
+                        if mm.get_free_memory(device) < self.reserved + memory + headroom:
+                            if self.active:
+                                self.condition.wait(0.05)
+                                continue
+                            parallel, memory, resident = False, 0, None
+                    if parallel or self.active == 0:
                         self.exclusive = not parallel
                         self.active += 1
-                        self.reserved += memory or 0
+                        self.reserved += memory
                         self.peak = max(self.peak, self.active)
                         break
                 self.condition.wait(0.05)
@@ -101,7 +110,7 @@ class NodeAdmission:
         try:
             if parallel:
                 token = mm.resident_model_scope.set(())
-            if memory is not None:
+            if resident is not None:
                 # Sampler state lives on the outer model and patcher; the resident
                 # UNet and its immutable parameters are shared by these calls.
                 outer = copy.copy(resident.model)
@@ -114,8 +123,8 @@ class NodeAdmission:
                 mm.resident_model_scope.reset(token)
             with self.condition:
                 self.active -= 1
-                self.reserved -= memory or 0
-                if memory is not None:
+                self.reserved -= memory
+                if resident is not None:
                     self.draining = True
                 if self.active == 0:
                     self.exclusive = False

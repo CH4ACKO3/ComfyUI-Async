@@ -279,7 +279,7 @@ database_default_path = os.path.abspath(
 )
 parser.add_argument("--database-url", type=str, default=None, help="Specify the database URL, e.g. for an in-memory database you can use 'sqlite:///:memory:'. Defaults to 'comfyui.db' in the effective user directory.")
 parser.add_argument("--async-workers", type=int, default=2, help="Number of concurrent workflows in isolated GPU workers. Use 0 for the upstream executor.")
-parser.add_argument("--async-node-concurrency", type=int, default=2, help="Maximum concurrent node calls per device worker. Use 1 for serial node execution.")
+parser.add_argument("--async-node-concurrency", type=int, default=None, help="Optional limit on concurrent node calls per device worker. By default, admission follows available memory. Use 1 for serial node execution.")
 parser.add_argument("--enable-assets", action="store_true", help="Enable the assets system (API routes, database synchronization, and background scanning). Off by default.")
 parser.add_argument("--disable-assets", action="store_true", help="Disable the assets system, even when --enable-assets is also given.")
 parser.add_argument("--enable-asset-hashing", action="store_true", help="Compute blake3 content hashes when scanning assets. Files uploaded through the API are hashed either way. Hashing enables future asset-portability features (deduplication, cross-machine model resolution) but adds startup cost and per-output cost on large models directories. Off by default; enable to opt in. Requires the assets system (--enable-assets or --windows-standalone-build).")
@@ -296,7 +296,7 @@ if args.cache_ram is not None and len(args.cache_ram) > 2:
 
 if args.async_workers < 0:
     parser.error("--async-workers must be nonnegative")
-if args.async_node_concurrency < 1:
+if args.async_node_concurrency is not None and args.async_node_concurrency < 1:
     parser.error("--async-node-concurrency must be positive")
 
 if args.high_ram:
