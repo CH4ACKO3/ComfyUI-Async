@@ -2,6 +2,7 @@ import errno
 import os
 import sys
 import asyncio
+import copy
 import traceback
 import time
 
@@ -331,6 +332,7 @@ class PromptServer():
         self.last_node_id = None
         self.client_id = None
         self.workflow_metadata = {}
+        self.on_prompt_handlers = []
 
 
         @routes.get('/ws')
@@ -1239,8 +1241,18 @@ class PromptServer():
                 changes = data.get("changes", {})
                 check_nodes(changes)
                 base_revision = data["base_revision"]
-                prompt, revision, changed, affected, targets = self.async_executor.prepare_event(key, base_revision, changes, data.get("refresh", []))
-                extra_data = dict(data.get("extra_data", {}))
+                source_prompt, changed = self.async_executor.prepare_event(key, base_revision, changes, data.get("refresh", []))
+                extra_data = copy.deepcopy(data.get("extra_data", {}))
+                extra_data["client_id"] = key[0]
+                extra_data["graph_event"] = {"graph_id": key[1], "revision": base_revision + 1, "event_id": event_id, "changed_nodes": sorted(changed)}
+                submitted = self.trigger_on_prompt({**data, "prompt": copy.deepcopy(source_prompt), "prompt_id": event_id, "client_id": key[0], "extra_data": extra_data})
+                prompt = submitted["prompt"]
+                check_nodes(prompt)
+                if any(node is None for node in prompt.values()):
+                    raise ValueError("Preprocessed nodes require definitions")
+                self.node_replace_manager.apply_replacements(prompt)
+                prompt, revision, changed, affected, targets = self.async_executor.resolve_event(key, base_revision, prompt, changed)
+                extra_data = dict(submitted.get("extra_data", {}))
                 extra_data["client_id"] = key[0]
                 extra_data["graph_event"] = {"graph_id": key[1], "revision": revision, "event_id": event_id, "changed_nodes": changed}
                 number = float(data.get("number", self.number))
@@ -1250,7 +1262,6 @@ class PromptServer():
                 return graph_error(exc, 409)
             except (ValueError, TypeError) as exc:
                 return graph_error(exc)
-            self.node_replace_manager.apply_replacements(prompt)
             targets.extend(node_id for node_id in affected if node_id not in targets and getattr(nodes.NODE_CLASS_MAPPINGS.get(prompt[node_id]["class_type"]), "OUTPUT_NODE", False))
             valid = await execution.validate_prompt(event_id, prompt, list(affected)) if affected else (True, None, [], {})
             if not valid[0] or valid[3]:
@@ -1263,7 +1274,7 @@ class PromptServer():
             extra_data["create_time"] = int(time.time() * 1000)
             item = (number, event_id, prompt, extra_data, targets, sensitive)
             try:
-                self.async_executor.enqueue(item, base_revision)
+                self.async_executor.enqueue(item, base_revision, source_prompt)
             except ValueError as exc:
                 return graph_error(exc, 409)
             self.number += 1
@@ -1582,6 +1593,17 @@ class PromptServer():
 
         if call_on_start is not None:
             call_on_start(scheme, self.address, self.port)
+
+    def add_on_prompt_handler(self, handler):
+        self.on_prompt_handlers.append(handler)
+
+    def trigger_on_prompt(self, json_data):
+        for handler in self.on_prompt_handlers:
+            try:
+                json_data = handler(json_data)
+            except Exception:
+                logging.exception("Error in prompt preprocessing hook")
+        return json_data
 
     def send_progress_text(
         self, text: Union[bytes, bytearray, str], node_id: str, sid=None

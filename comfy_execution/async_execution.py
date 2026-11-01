@@ -310,6 +310,7 @@ class ResidentGraphExecutor:
         self.clear_requested = False
         self.revisions = {}
         self.frames = {}
+        self.resolved_frames = {}
         from comfy_execution.async_scheduler import DeviceScheduler
         self.scheduler = DeviceScheduler(self.directory.name, default_device, server.send_sync)
         self.stopping = threading.Event()
@@ -352,6 +353,7 @@ class ResidentGraphExecutor:
             self.frames[key] = copy.deepcopy(prompt)
             for node in self.frames[key].values():
                 node.setdefault("_meta", {})["input_revision"] = 0
+            self.resolved_frames[key] = copy.deepcopy(self.frames[key])
             self.revisions[key] = 0
 
     def prepare_event(self, key, base_revision, changes, refresh):
@@ -367,7 +369,6 @@ class ResidentGraphExecutor:
             if base_revision != self.revisions[key]:
                 raise GraphRevisionError("Graph revision changed; reload its state before submitting this event")
             prompt = copy.deepcopy(self.frames[key])
-        revision = base_revision + 1
         changed = set(changes) | set(refresh)
         for node_id, node in changes.items():
             if node is None:
@@ -379,8 +380,20 @@ class ResidentGraphExecutor:
         for node_id in refresh:
             if node_id not in prompt:
                 raise ValueError(f"Unknown node {node_id}")
-        for node_id in changed & prompt.keys():
-            prompt[node_id].setdefault("_meta", {})["input_revision"] = revision
+        return prompt, changed
+
+    def resolve_event(self, key, base_revision, prompt, changed):
+        with self.queue.mutex:
+            if base_revision != self.revisions[key]:
+                raise GraphRevisionError("Graph changed while preprocessing this event; resubmit it")
+            previous = self.resolved_frames[key]
+        revision = base_revision + 1
+        changed = set(changed) | (previous.keys() - prompt.keys())
+        for node_id, node in prompt.items():
+            old = previous.get(node_id)
+            if old is None or (node["class_type"], node["inputs"], node.get("_meta", {}).get("gpu_devices")) != (old["class_type"], old["inputs"], old.get("_meta", {}).get("gpu_devices")):
+                changed.add(node_id)
+            node.setdefault("_meta", {})["input_revision"] = revision if node_id in changed else old["_meta"]["input_revision"]
         children = {node_id: set() for node_id in changed | prompt.keys()}
         for node_id, node in prompt.items():
             for value in node["inputs"].values():
@@ -396,14 +409,15 @@ class ResidentGraphExecutor:
         targets = [node_id for node_id in prompt if node_id in affected and not children[node_id]]
         return prompt, revision, sorted(changed), affected, targets
 
-    def enqueue(self, item, base_revision):
+    def enqueue(self, item, base_revision, source_prompt):
         key = graph_key(item[3])
         with self.queue.mutex:
             if base_revision != self.revisions.get(key):
                 raise GraphRevisionError("Graph changed while validating this event; resubmit it")
             if item[1] in self.queue.history or any(queued[1] == item[1] for queued in self.queue.queue + list(self.queue.currently_running.values())):
                 raise ValueError("event_id has already been submitted")
-            self.frames[key] = copy.deepcopy(item[2])
+            self.frames[key] = copy.deepcopy(source_prompt)
+            self.resolved_frames[key] = copy.deepcopy(item[2])
             self.revisions[key] = item[3]["graph_event"]["revision"]
             self.queue.put(item)
 
