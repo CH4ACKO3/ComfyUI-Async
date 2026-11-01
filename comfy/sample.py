@@ -24,7 +24,10 @@ def prepare_noise(latent_image, seed, noise_inds=None):
     creates random noise given a latent image and a seed.
     optional arg skip can be used to skip and discard x number of noise generations for a given seed
     """
-    generator = torch.manual_seed(seed)
+    if comfy.model_management.resident_model_scope.get() is None:
+        generator = torch.manual_seed(seed)
+    else:
+        generator = torch.Generator(device="cpu").manual_seed(seed)
 
     if latent_image.is_nested:
         tensors = latent_image.unbind()

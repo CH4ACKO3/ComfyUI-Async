@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import concurrent.futures
 import contextvars
 import heapq
 import json
@@ -65,6 +66,8 @@ class Worker:
         self.mutex = threading.Lock()
         self.lifecycle = threading.Lock()
         self.closed = False
+        self.pending = {}
+        self.request_index = 0
 
     def start(self):
         authkey = secrets.token_bytes(32)
@@ -109,6 +112,8 @@ class Worker:
                 return payload
 
     def request(self, command, payload=None):
+        if self.config["role"] == "node":
+            return self.submit(command, payload).result()
         with self.mutex:
             if self.closed:
                 raise WorkerError("Execution interrupted")
@@ -119,6 +124,44 @@ class Worker:
             except (BrokenPipeError, OSError) as exc:
                 raise WorkerError("Execution worker stopped") from exc
             return self.receive()
+
+    def submit(self, command, payload):
+        with self.mutex:
+            if self.closed:
+                raise WorkerError("Execution interrupted")
+            if self.process is None:
+                self.start()
+                threading.Thread(target=self.read_responses, daemon=True).start()
+            self.request_index += 1
+            request_id = self.request_index
+            future = concurrent.futures.Future()
+            self.pending[request_id] = future
+            try:
+                self.connection.send((request_id, command, payload))
+            except (BrokenPipeError, OSError) as exc:
+                self.pending.pop(request_id)
+                raise WorkerError("Execution worker stopped") from exc
+            return future
+
+    def read_responses(self):
+        try:
+            while True:
+                kind, payload = self.connection.recv()
+                if kind == "event":
+                    self.send_event(*payload)
+                    continue
+                request_id, response = payload
+                with self.mutex:
+                    future = self.pending.pop(request_id)
+                if kind == "error":
+                    future.set_exception(WorkerError(response))
+                else:
+                    future.set_result(response)
+        except (EOFError, OSError):
+            with self.mutex:
+                pending, self.pending = self.pending, {}
+            for future in pending.values():
+                future.set_exception(WorkerError("Execution worker stopped; see the server log"))
 
     def close(self):
         with self.lifecycle:
@@ -301,6 +344,8 @@ class AsyncExecutorPool:
     def accepts(self, item, slot):
         key = session_key(item[3])
         if key is None:
+            return True
+        if item[3]["execution_session"]["policy"] == "fifo":
             return True
         return self.session_slots[key] == slot
 

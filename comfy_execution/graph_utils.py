@@ -1,3 +1,7 @@
+from contextvars import ContextVar
+from itertools import count
+
+
 def is_link(obj):
     if not isinstance(obj, list):
         return False
@@ -11,9 +15,7 @@ def is_link(obj):
 
 # The GraphBuilder is just a utility class that outputs graphs in the form expected by the ComfyUI back-end
 class GraphBuilder:
-    _default_prefix_root = ""
-    _default_prefix_call_index = 0
-    _default_prefix_graph_index = 0
+    _default_prefix = ContextVar("graph_builder_prefix", default=("", 0, count()))
 
     def __init__(self, prefix = None):
         if prefix is None:
@@ -25,20 +27,19 @@ class GraphBuilder:
 
     @classmethod
     def set_default_prefix(cls, prefix_root, call_index, graph_index = 0):
-        cls._default_prefix_root = prefix_root
-        cls._default_prefix_call_index = call_index
-        cls._default_prefix_graph_index = graph_index
+        cls._default_prefix.set((prefix_root, call_index, count(graph_index)))
 
     @classmethod
     def alloc_prefix(cls, root=None, call_index=None, graph_index=None):
+        default_root, default_call, graph_indices = cls._default_prefix.get()
+        default_graph = next(graph_indices)
         if root is None:
-            root = GraphBuilder._default_prefix_root
+            root = default_root
         if call_index is None:
-            call_index = GraphBuilder._default_prefix_call_index
+            call_index = default_call
         if graph_index is None:
-            graph_index = GraphBuilder._default_prefix_graph_index
+            graph_index = default_graph
         result = f"{root}.{call_index}.{graph_index}."
-        GraphBuilder._default_prefix_graph_index += 1
         return result
 
     def node(self, class_type, id=None, **kwargs):

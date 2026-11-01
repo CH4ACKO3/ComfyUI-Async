@@ -22,6 +22,7 @@ import logging
 from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
 import threading
+import contextvars
 import torch
 import sys
 import platform
@@ -633,6 +634,7 @@ except:
     pass
 
 current_loaded_models: list[LoadedModel] = []
+resident_model_scope = contextvars.ContextVar("resident_model_scope", default=None)
 
 DIRTY_MMAPS = set()
 
@@ -891,6 +893,8 @@ def minimum_inference_memory():
     return (1024 * 1024 * 1024) * 0.8 + extra_reserved_memory()
 
 def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins_required=0, ram_required=0):
+    if resident_model_scope.get() is not None:
+        raise RuntimeError("Cannot evict models during shared inference")
     cleanup_models_gc()
     if not for_dynamic:
         detail("Non dynamic memory free called! memory_required=%s pins_required=%s ram_required=%s", memory_required, pins_required, ram_required)
@@ -937,6 +941,11 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
     return unloaded_models
 
 def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
+    resident = resident_model_scope.get()
+    if resident is not None:
+        if any(model not in resident for model in models):
+            raise RuntimeError("Concurrent inference requested a model outside its residency lease")
+        return
     cleanup_models_gc()
     global vram_state
 
@@ -2174,6 +2183,8 @@ def unload_all_models():
 
 def unload_model_and_clones(model: ModelPatcher, unload_additional_models=True, all_devices=False):
     'Unload only model and its clones - primarily for multigpu cloning purposes.'
+    if resident_model_scope.get() is not None:
+        raise RuntimeError("Cannot unload models during shared inference")
     initial_keep_loaded: list[LoadedModel] = current_loaded_models.copy()
     additional_models = []
     if unload_additional_models:
@@ -2209,19 +2220,32 @@ class InterruptProcessingException(BaseException):
 interrupt_processing_mutex = threading.RLock()
 
 interrupt_processing = False
+processing_interrupt_event = contextvars.ContextVar("processing_interrupt_event", default=None)
 def interrupt_current_processing(value=True):
+    event = processing_interrupt_event.get()
+    if event is not None:
+        event.set() if value else event.clear()
+        return
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:
         interrupt_processing = value
 
 def processing_interrupted():
+    event = processing_interrupt_event.get()
+    if event is not None:
+        return event.is_set()
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:
         return interrupt_processing
 
 def throw_exception_if_processing_interrupted():
+    event = processing_interrupt_event.get()
+    if event is not None:
+        if event.is_set():
+            raise InterruptProcessingException()
+        return
     global interrupt_processing
     global interrupt_processing_mutex
     with interrupt_processing_mutex:

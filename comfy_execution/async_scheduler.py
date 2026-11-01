@@ -58,21 +58,30 @@ class DeviceQueue:
                     raise WorkerError("GPU worker was stopped")
                 if command == "call" and self.scheduler.cancelled(payload["prompt_id"]):
                     raise WorkerError("Execution interrupted")
-                response = self.worker.request(command, payload)
-                self.stats = response["stats"]
-                if command == "call" and self.scheduler.cancelled(payload["prompt_id"]):
-                    raise WorkerError("Execution interrupted")
-                future.set_result(response["value"])
+                response = self.worker.submit(command, payload)
             except Exception as exc:
-                if not self.closed and self.worker.process is not None and (self.worker.connection is None or self.worker.process.poll() is not None):
-                    self.close()
-                future.set_exception(exc)
-            finally:
-                with self.scheduler.mutex:
-                    elapsed = time.monotonic() - start
-                    self.durations[kind] = 0.75 * self.durations.get(kind, elapsed) + 0.25 * elapsed
-                    self.pending -= 1
-                    self.remaining = max(0.0, self.remaining - estimate)
+                response = concurrent.futures.Future()
+                response.set_exception(exc)
+            response.add_done_callback(lambda response, item=item, start=start: self.finish(response, item, start))
+
+    def finish(self, response, item, start):
+        command, payload, kind, estimate, future = item
+        try:
+            result = response.result()
+            self.stats = result["stats"]
+            if command == "call" and self.scheduler.cancelled(payload["prompt_id"]):
+                raise WorkerError("Execution interrupted")
+            future.set_result(result["value"])
+        except Exception as exc:
+            if not self.closed and self.worker.process is not None and (self.worker.connection is None or self.worker.process.poll() is not None):
+                self.close()
+            future.set_exception(exc)
+        finally:
+            with self.scheduler.mutex:
+                elapsed = time.monotonic() - start
+                self.durations[kind] = 0.75 * self.durations.get(kind, elapsed) + 0.25 * elapsed
+                self.pending -= 1
+                self.remaining = max(0.0, self.remaining - estimate)
 
     def close(self):
         self.closed = True
@@ -97,7 +106,6 @@ class DeviceScheduler:
         return os.path.exists(os.path.join(self.directory, prompt_id + ".cancel"))
 
     def forward(self, event, data, sid=None):
-        # Each device executes one call at a time; events retain their prompt id.
         if isinstance(data, dict):
             prompt_id = data.get("prompt_id")
         elif isinstance(data, tuple) and len(data) == 2 and isinstance(data[1], dict):

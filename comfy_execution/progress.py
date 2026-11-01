@@ -1,4 +1,5 @@
 from typing import TypedDict, Dict, Optional, Tuple
+from contextvars import ContextVar
 from typing_extensions import override
 from PIL import Image
 from enum import Enum
@@ -320,6 +321,7 @@ class ProgressRegistry:
 
 # Global registry instance
 global_progress_registry: ProgressRegistry | None = None
+scoped_progress_registry = ContextVar("scoped_progress_registry", default=None)
 
 def reset_progress_state(prompt_id: str, dynprompt: "DynamicPrompt") -> None:
     global global_progress_registry
@@ -339,6 +341,9 @@ def add_progress_handler(handler: ProgressHandler) -> None:
 
 
 def get_progress_state() -> ProgressRegistry:
+    scoped = scoped_progress_registry.get()
+    if scoped is not None:
+        return scoped
     global global_progress_registry
     if global_progress_registry is None:
         from comfy_execution.graph import DynamicPrompt
